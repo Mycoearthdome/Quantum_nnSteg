@@ -7,7 +7,7 @@ import logging
 from qiskit import QuantumCircuit, QuantumRegister, transpile
 from qiskit_aer import Aer
 from qiskit_experiments.library.characterization import LocalReadoutError
-from qiskit_ibm_runtime import QiskitRuntimeService
+from qiskit_ibm_runtime import QiskitRuntimeService, Sampler
 from qiskit_aer.noise import NoiseModel
 from scipy.optimize import minimize
 
@@ -161,15 +161,37 @@ def train_offline_model(max_epochs=3000, save_every=100):
 
 # --- Backend job submission with retry and queue wait ---
 def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
+    """
+    Runs the given list of quantum circuits with retries upon failure.
+    Transpiles each circuit for the specified backend before running.
+
+    Parameters:
+    - backend: The quantum backend to run the job on.
+    - circuits: A list of QuantumCircuit objects to be executed.
+    - shots: The number of shots to run for each circuit.
+    - max_retries: Maximum number of retry attempts in case of failure.
+    - wait_time: The time to wait between retries (in seconds).
+
+    Returns:
+    - result: The result object from the job or None if all retries fail.
+    """
     for attempt in range(max_retries):
         try:
-            transpiled = transpile(circuits, backend)
-            job = backend.run(transpiled, shots=shots)
+            # Transpile each circuit for the backend before running
+            transpiled_circuits = [transpile(circuit, backend) for circuit in circuits]
+            
+            # Create the sampler object
+            sampler = Sampler(backend)
+            
+            # Execute the quantum circuits
+            result = sampler.run(transpiled_circuits, shots=shots).result()
+            
             logging.info(f"Job submitted successfully on attempt {attempt + 1}")
-            result = job.result()
             return result
         except Exception as e:
             logging.warning(f"Run attempt {attempt + 1} failed: {e}")
+            
+            # If there are retries left, wait and try again
             if attempt < max_retries - 1:
                 logging.info(f"Waiting {wait_time}s before retrying...")
                 time.sleep(wait_time)
