@@ -11,7 +11,7 @@ from qiskit_ibm_runtime import QiskitRuntimeService
 from qiskit_aer.noise import NoiseModel
 from scipy.optimize import minimize
 
-service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_KEY_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
+service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_TOKEN_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
 #backend = service.least_busy(backend_filter=lambda b: b.num_qubits >= 5 and b.simulator is False and b.operational)
 
 backend = service.backend('ibm_sherbrooke')
@@ -183,8 +183,8 @@ def execute_with_mitigation(circuits, backend, batch_size=20):
     total_circuits = len(circuits)
 
     qubit_list = list(range(circuits[0].num_qubits))
-    logging.info(f"Starting measurement calibration on {backend.name()}...")
-    calibration_exp = LocalReadoutError(qubit_list=qubit_list)
+    logging.info(f"Starting measurement calibration on {backend.name}...")
+    calibration_exp = LocalReadoutError(physical_qubits=qubit_list)
     calibration_data = calibration_exp.run(backend).block_for_results()
 
     for i in range(0, total_circuits, batch_size):
@@ -255,7 +255,7 @@ def embed_bits(encode_weights, img, bits, backend):
     norm_pixels, alpha = image_to_normalized_pixels(img)
     circuits = prepare_embedding_circuits(encode_weights, norm_pixels, bits)
     
-    logging.info(f"Sending {len(circuits)} encoding circuits to backend {backend.name()}...")
+    logging.info(f"Sending {len(circuits)} encoding circuits to backend {backend.name}...")
     
     # Execute the circuits on the backend with mitigation
     mitigated_counts = execute_with_mitigation(circuits, backend)
@@ -287,7 +287,7 @@ def embed_bits(encode_weights, img, bits, backend):
 def decode_bits(decode_weights, img, n_bits, backend):
     norm_pixels, _ = image_to_normalized_pixels(img)
     circuits = prepare_decoding_circuits(decode_weights, norm_pixels, n_bits)
-    logging.info(f"Sending {len(circuits)} decoding circuits to backend {backend.name()}...")
+    logging.info(f"Sending {len(circuits)} decoding circuits to backend {backend.name}...")
     mitigated_counts = execute_with_mitigation(circuits, backend)
     exp_vals = counts_to_expectation(mitigated_counts)
     return [1 if val > 0 else 0 for val in exp_vals]
@@ -301,12 +301,11 @@ def bits_to_bytes(bits):
 
 # --- Main ---
 def main():
-    # Train model offline on simulator with noise (reduce epochs for testing)
-    train_offline_model(max_epochs=100, save_every=25) #3000 max_epochs originally
-
     # Load trained weights
     if not (os.path.exists("encode_weights.npy") and os.path.exists("decode_weights.npy")):
-        raise FileNotFoundError("Model weights missing. Please run training first.")
+         # Train model offline on simulator with noise (reduce epochs for testing)
+        train_offline_model(max_epochs=100, save_every=25) #3000 max_epochs originally
+
     encode_weights = np.load("encode_weights.npy")
     decode_weights = np.load("decode_weights.npy")
     logging.info("Loaded trained model weights.")
