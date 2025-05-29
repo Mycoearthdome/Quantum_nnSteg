@@ -11,7 +11,7 @@ from qiskit_ibm_runtime import QiskitRuntimeService
 from qiskit_aer.noise import NoiseModel
 from scipy.optimize import minimize
 
-service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR API KEY HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
+service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_KEY_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
 #backend = service.least_busy(backend_filter=lambda b: b.num_qubits >= 5 and b.simulator is False and b.operational)
 
 backend = service.backend('ibm_sherbrooke')
@@ -101,7 +101,7 @@ def train_offline_model(max_epochs=3000, save_every=100):
         encode_w = weights[:12]
         decode_w = weights[12:]
         bit_loss = 0.0
-        shots = 256
+        shots = 50 #250
 
         for r, g, b, bit in training_data:
             # Create the encoding and decoding circuits
@@ -246,18 +246,41 @@ def prepare_decoding_circuits(decode_weights, pixels, n_bits):
         circuits.append(qc)
     return circuits
 
-# --- Embed Bits into Image ---
 def embed_bits(encode_weights, img, bits, backend):
+    """
+    Embed secret bits into the image using quantum encoding circuits.
+    Each bit is encoded into the quantum state of the image pixels.
+    """
+    # Convert image to normalized pixel values (RGB)
     norm_pixels, alpha = image_to_normalized_pixels(img)
     circuits = prepare_embedding_circuits(encode_weights, norm_pixels, bits)
+    
     logging.info(f"Sending {len(circuits)} encoding circuits to backend {backend.name()}...")
-    execute_with_mitigation(circuits, backend)
-
-    # Simple pixel modification as placeholder: brighten red channel slightly for bit=1
-    for idx, bit in enumerate(bits):
+    
+    # Execute the circuits on the backend with mitigation
+    mitigated_counts = execute_with_mitigation(circuits, backend)
+    
+    # Process the result of each circuit to modify the image pixels
+    for idx, (bit, count) in enumerate(zip(bits, mitigated_counts)):
         y, x = divmod(idx, norm_pixels.shape[1])
-        norm_pixels[y, x, 0] = min(1.0, norm_pixels[y, x, 0] + 0.01 * bit)
+        
+        # Assuming each pixel corresponds to one quantum circuit (RGB values)
+        # Extract the quantum measurement result (0 or 1)
+        if '1' in count:  # If '1' was measured in the quantum circuit
+            result_bit = 1
+        else:
+            result_bit = 0
+        
+        # Use the quantum result to encode the bit into the image
+        # Modify the pixel value based on the result: shift or slightly adjust color channels
+        if result_bit == 1:
+            # Example: Adjust red channel if the encoded bit is 1
+            norm_pixels[y, x, 0] = min(1.0, norm_pixels[y, x, 0] + 0.05)  # Increase red channel
+        else:
+            # If the encoded bit is 0, leave the pixel unaltered or slightly reduce red
+            norm_pixels[y, x, 0] = max(0.0, norm_pixels[y, x, 0] - 0.05)  # Decrease red channel
 
+    # Convert back to image
     return normalized_pixels_to_image(norm_pixels, alpha)
 
 # --- Decode Bits from Image ---
@@ -279,7 +302,7 @@ def bits_to_bytes(bits):
 # --- Main ---
 def main():
     # Train model offline on simulator with noise (reduce epochs for testing)
-    train_offline_model(max_epochs=3000, save_every=100)
+    train_offline_model(max_epochs=100, save_every=25) #3000 max_epochs originally
 
     # Load trained weights
     if not (os.path.exists("encode_weights.npy") and os.path.exists("decode_weights.npy")):
