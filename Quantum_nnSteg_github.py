@@ -7,11 +7,12 @@ import logging
 from qiskit import QuantumCircuit, QuantumRegister, transpile
 from qiskit_aer import Aer
 from qiskit_experiments.library.characterization import LocalReadoutError
+from qiskit_experiments.framework import AnalysisResultData
 from qiskit_ibm_runtime import QiskitRuntimeService, Sampler
 from qiskit_aer.noise import NoiseModel
 from scipy.optimize import minimize
 
-service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_TOKEN_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
+service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_KEY_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
 #backend = service.least_busy(backend_filter=lambda b: b.num_qubits >= 5 and b.simulator is False and b.operational)
 
 backend = service.backend('ibm_sherbrooke')
@@ -206,9 +207,23 @@ def execute_with_mitigation(circuits, backend, batch_size=20):
 
     qubit_list = list(range(circuits[0].num_qubits))
     logging.info(f"Starting measurement calibration on {backend.name}...")
+    
+    # Run the calibration experiment
     calibration_exp = LocalReadoutError(physical_qubits=qubit_list)
     calibration_data = calibration_exp.run(backend).block_for_results()
 
+    # Extract the mitigator from the analysis results
+    analysis_results = calibration_data.analysis_results()
+    mitigator = None
+    for result in analysis_results:
+        if hasattr(result, 'value'):
+            mitigator = result.value
+            break
+
+    if mitigator is None:
+        raise ValueError("Mitigator not found in calibration analysis results.")
+
+    # Run circuits in batches and apply mitigation
     for i in range(0, total_circuits, batch_size):
         batch = circuits[i:i + batch_size]
         logging.info(f"Running batch {i // batch_size + 1} with {len(batch)} circuits...")
@@ -218,12 +233,15 @@ def execute_with_mitigation(circuits, backend, batch_size=20):
             mitigated_counts_all.extend([{} for _ in batch])
             continue
         try:
-            mitigated_result = calibration_exp.analysis.apply(result)
             for circ in batch:
-                mitigated_counts_all.append(mitigated_result.get_counts(circ))
+                raw_counts = result.get_counts(circ)
+                mitigated_counts = mitigator.mitigate(raw_counts)
+                mitigated_counts_all.append(mitigated_counts)
         except Exception as e:
             logging.error(f"Mitigation application failed: {e}")
-            mitigated_counts_all.extend([result.get_counts(circ) for circ in batch])
+            # Fall back to raw counts if mitigation fails
+            for circ in batch:
+                mitigated_counts_all.append(result.get_counts(circ))
         time.sleep(5)  # avoid flooding backend queue
 
     return mitigated_counts_all
