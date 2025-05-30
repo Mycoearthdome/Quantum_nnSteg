@@ -185,10 +185,12 @@ def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
             sampler = Sampler(backend)
             
             # Execute the quantum circuits
-            result = sampler.run(transpiled_circuits, shots=shots).result()
-            
+            job = sampler.run(transpiled_circuits)
             logging.info(f"Job submitted successfully on attempt {attempt + 1}")
-            return result
+            result = job.result()
+
+            return result.values
+
         except Exception as e:
             logging.warning(f"Run attempt {attempt + 1} failed: {e}")
             
@@ -201,7 +203,7 @@ def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
                 return None
 
 # --- Measurement Error Mitigation ---
-def execute_with_mitigation(circuits, backend, batch_size=20):
+def execute_with_mitigation(circuits, backend, batch_size=20, shots=1024):
     mitigated_counts_all = []
     total_circuits = len(circuits)
 
@@ -233,15 +235,16 @@ def execute_with_mitigation(circuits, backend, batch_size=20):
             mitigated_counts_all.extend([{} for _ in batch])
             continue
         try:
-            for circ in batch:
-                raw_counts = result.get_counts(circ)
+            for quasi_dist in result:
+                raw_counts = {k: v * shots for k, v in quasi_dist.items()}  # convert to pseudo-counts
                 mitigated_counts = mitigator.mitigate(raw_counts)
                 mitigated_counts_all.append(mitigated_counts)
         except Exception as e:
             logging.error(f"Mitigation application failed: {e}")
             # Fall back to raw counts if mitigation fails
-            for circ in batch:
-                mitigated_counts_all.append(result.get_counts(circ))
+            for quasi_dist in result:
+                raw_counts = {k: v * shots for k, v in quasi_dist.items()}
+                mitigated_counts_all.append(raw_counts)
         time.sleep(5)  # avoid flooding backend queue
 
     return mitigated_counts_all
