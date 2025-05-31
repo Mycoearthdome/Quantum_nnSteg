@@ -8,9 +8,11 @@ from qiskit import QuantumCircuit, QuantumRegister, transpile
 from qiskit_aer import Aer
 from qiskit_experiments.library.characterization import LocalReadoutError
 from qiskit_experiments.framework import AnalysisResultData
-from qiskit_ibm_runtime import QiskitRuntimeService, Sampler
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
 from qiskit_aer.noise import NoiseModel
 from scipy.optimize import minimize
+from collections import Counter
+import matplotlib.pyplot as plt
 
 service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_KEY_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
 #backend = service.least_busy(backend_filter=lambda b: b.num_qubits >= 5 and b.simulator is False and b.operational)
@@ -102,7 +104,7 @@ def train_offline_model(max_epochs=3000, save_every=100):
         encode_w = weights[:12]
         decode_w = weights[12:]
         bit_loss = 0.0
-        shots = 50 #250
+        shots = 512 #250
 
         for r, g, b, bit in training_data:
             # Create the encoding and decoding circuits
@@ -185,12 +187,36 @@ def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
             sampler = Sampler(backend)
             
             # Execute the quantum circuits
-            job = sampler.run(transpiled_circuits)
+            job = sampler.run(transpiled_circuits, shots=shots)
             logging.info(f"Job submitted successfully on attempt {attempt + 1}")
-            result = job.result()
+            results = job.result()
 
-            return result.values
+            bitstream = ""
 
+            for i, pub_result in enumerate(results):
+                bit_array = pub_result.data.meas  # This is BitArray print(dir(bit_array)) #DEBUG
+
+                try:
+                    bitstrings = bit_array.get_bitstrings()
+
+                    if not bitstrings:
+                        logging.warning(f"No bitstrings for circuit {i}")
+                        continue
+
+                    # Count frequency of bitstrings
+                    most_common_str, _ = Counter(bitstrings).most_common(1)[0]
+                    bitstream += most_common_str
+
+
+                except Exception as e:
+                    logging.error(f"Failed to decode circuit {i}: {e}")
+                    continue
+
+            if not bitstream:
+                logging.warning("Bitstream is empty. All circuits failed?")
+
+            return bitstream
+        
         except Exception as e:
             logging.warning(f"Run attempt {attempt + 1} failed: {e}")
             
@@ -203,60 +229,25 @@ def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
                 return None
 
 # --- Measurement Error Mitigation ---
-def execute_with_mitigation(circuits, backend, batch_size=20, shots=1024):
-    mitigated_counts_all = []
+def execute(circuits, backend, batch_size=20, shots=1024):
+    bitstream = ''
     total_circuits = len(circuits)
 
     qubit_list = list(range(circuits[0].num_qubits))
     logging.info(f"Starting measurement calibration on {backend.name}...")
     
-    # Run the calibration experiment
-    calibration_exp = LocalReadoutError(physical_qubits=qubit_list)
-    calibration_data = calibration_exp.run(backend).block_for_results()
-
-    # Extract the mitigator from the analysis results
-    analysis_results = calibration_data.analysis_results()
-    mitigator = None
-    for result in analysis_results:
-        if hasattr(result, 'value'):
-            mitigator = result.value
-            break
-
-    if mitigator is None:
-        raise ValueError("Mitigator not found in calibration analysis results.")
-
-    # Run circuits in batches and apply mitigation
+    # Run circuits in batches
     for i in range(0, total_circuits, batch_size):
         batch = circuits[i:i + batch_size]
         logging.info(f"Running batch {i // batch_size + 1} with {len(batch)} circuits...")
-        result = run_with_retry(backend, batch)
+        result = run_with_retry(backend, batch, shots=shots)
         if result is None:
-            logging.error(f"Batch {i // batch_size + 1} failed. Returning empty counts for this batch.")
-            mitigated_counts_all.extend([{} for _ in batch])
             continue
-        try:
-            for quasi_dist in result:
-                raw_counts = {k: v * shots for k, v in quasi_dist.items()}  # convert to pseudo-counts
-                mitigated_counts = mitigator.mitigate(raw_counts)
-                mitigated_counts_all.append(mitigated_counts)
-        except Exception as e:
-            logging.error(f"Mitigation application failed: {e}")
-            # Fall back to raw counts if mitigation fails
-            for quasi_dist in result:
-                raw_counts = {k: v * shots for k, v in quasi_dist.items()}
-                mitigated_counts_all.append(raw_counts)
+        bitstream += result
+
         time.sleep(5)  # avoid flooding backend queue
 
-    return mitigated_counts_all
-
-# --- Counts to Expectation Value ---
-def counts_to_expectation(counts, shots=1024):
-    exp_vals = []
-    for count in counts:
-        p0 = count.get('0', 0) / shots
-        p1 = count.get('1', 0) / shots
-        exp_vals.append(p1 - p0)
-    return exp_vals
+    return bitstream
 
 # --- Image Normalization Functions ---
 def image_to_normalized_pixels(img):
@@ -301,15 +292,15 @@ def embed_bits(encode_weights, img, bits, backend):
     logging.info(f"Sending {len(circuits)} encoding circuits to backend {backend.name}...")
     
     # Execute the circuits on the backend with mitigation
-    mitigated_counts = execute_with_mitigation(circuits, backend)
+    bitstream = execute(circuits, backend)
     
     # Process the result of each circuit to modify the image pixels
-    for idx, (bit, count) in enumerate(zip(bits, mitigated_counts)):
+    for idx, bit in enumerate(bitstream):
         y, x = divmod(idx, norm_pixels.shape[1])
         
         # Assuming each pixel corresponds to one quantum circuit (RGB values)
         # Extract the quantum measurement result (0 or 1)
-        if '1' in count:  # If '1' was measured in the quantum circuit
+        if bit == "1":  # If '1' was measured in the quantum circuit
             result_bit = 1
         else:
             result_bit = 0
@@ -331,9 +322,9 @@ def decode_bits(decode_weights, img, n_bits, backend):
     norm_pixels, _ = image_to_normalized_pixels(img)
     circuits = prepare_decoding_circuits(decode_weights, norm_pixels, n_bits)
     logging.info(f"Sending {len(circuits)} decoding circuits to backend {backend.name}...")
-    mitigated_counts = execute_with_mitigation(circuits, backend)
-    exp_vals = counts_to_expectation(mitigated_counts)
-    return [1 if val > 0 else 0 for val in exp_vals]
+    bitstream = execute(circuits, backend)
+    bitstream_int = [int(bit) for bit in bitstream]
+    return [1 if val > 0 else 0 for val in bitstream_int]
 
 # --- Bit/Byte Conversions ---
 def bytes_to_bits(data):
@@ -347,7 +338,7 @@ def main():
     # Load trained weights
     if not (os.path.exists("encode_weights.npy") and os.path.exists("decode_weights.npy")):
          # Train model offline on simulator with noise (reduce epochs for testing)
-        train_offline_model(max_epochs=100, save_every=25) #3000 max_epochs originally
+        train_offline_model() #1000-3000 max_epochs hopefully.
 
     encode_weights = np.load("encode_weights.npy")
     decode_weights = np.load("decode_weights.npy")
