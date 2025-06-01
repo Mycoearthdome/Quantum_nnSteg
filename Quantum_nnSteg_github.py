@@ -96,7 +96,6 @@ def evaluate_sample(args):
     sample, weights, shots = args
     r, g, b, bit = sample
 
-    # Ensure weights are split correctly even if misaligned
     encode_w = weights[:12]
     decode_w = weights[12:21]
 
@@ -104,8 +103,18 @@ def evaluate_sample(args):
     transpiled = transpile(circuit, backend_sim)
     job = backend_sim.run(transpiled, shots=shots, noise_model=noise_model)
     counts = job.result().get_counts()
-    prob = counts.get('1', 0) / shots
-    return (prob - bit) ** 2
+
+    total_error = 0
+    total_bits = 0
+
+    for bitstring, count in counts.items():
+        for i in range(len(bitstring)):
+            measured_bit = int(bitstring[-(i + 1)])  # Qiskit bit order: q_0 is rightmost
+            error = (measured_bit - bit) ** 2
+            total_error += error * count
+            total_bits += count
+
+    return total_error / total_bits
 
 # --- Optimized Training Loop ---
 def train_offline_model(max_epochs=5000, batch_size=100, save_every=100, shots=2048):
@@ -196,7 +205,9 @@ def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
 
                     # Count frequency of bitstrings
                     most_common_str, _ = Counter(bitstrings).most_common(1)[0]
-                    bitstream += most_common_str
+                    
+                    # Extract measured bit from qr[3] (leftmost qubit in Qiskit)
+                    bitstream += most_common_str[0]
 
 
                 except Exception as e:
@@ -258,6 +269,7 @@ def prepare_embedding_circuits(encode_weights, pixels, bits):
         qc = build_parameterized_encoding(r, g, b, bit)
         param_dict = {encode_params[i]: encode_weights[i] for i in range(len(encode_params))}
         qc = qc.assign_parameters(param_dict)
+        qc.measure_all() 
         circuits.append(qc)
     return circuits
 
@@ -269,6 +281,7 @@ def prepare_decoding_circuits(decode_weights, pixels, n_bits):
         qc = build_parameterized_decoding(r, g, b)
         param_dict = {decode_params[i]: decode_weights[i] for i in range(len(decode_params))}
         qc = qc.assign_parameters(param_dict)
+        qc.measure_all() 
         circuits.append(qc)
     return circuits
 
