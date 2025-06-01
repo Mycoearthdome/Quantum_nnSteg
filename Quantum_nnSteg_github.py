@@ -12,14 +12,13 @@ from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
 from qiskit_aer.noise import NoiseModel
 from scipy.optimize import minimize
 from collections import Counter
-import matplotlib.pyplot as plt
 
 service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_KEY_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
 #backend = service.least_busy(backend_filter=lambda b: b.num_qubits >= 5 and b.simulator is False and b.operational)
 
 backend = service.backend('ibm_sherbrooke')
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 
 # --- Quantum Circuit Builders ---
 def create_encoding_circuit(params, r, g, b, bit):
@@ -85,82 +84,71 @@ def generate_training_data(n_samples=500):
     return data
 
 # --- Training ---
-def train_offline_model(max_epochs=3000, save_every=100):
-    logging.info("Starting offline training with simulated backend...")
+from tqdm import tqdm
+from sklearn.utils import shuffle
 
-    # Set up backend and noise model
+def train_offline_model(max_epochs=3000, batch_size=100, save_every=100):
+    logging.warning("Starting improved offline training with simulated backend...")
+
     backend_sim = Aer.get_backend('aer_simulator')
     noise_model = NoiseModel.from_backend(backend_sim)
 
-    # Generate training data
-    training_data = generate_training_data()
+    full_data = generate_training_data(n_samples=2000)
 
-    # Initialize weights
     encode_weights = np.random.uniform(0, 2 * np.pi, 12)
     decode_weights = np.random.uniform(0, 2 * np.pi, 9)
+    best_weights = np.concatenate([encode_weights, decode_weights])
+    best_loss = float("inf")
 
-    # Define the loss function
-    def loss(weights):
+    def loss(weights, data_batch):
         encode_w = weights[:12]
         decode_w = weights[12:]
         bit_loss = 0.0
-        shots = 512 #250
+        shots = 256
 
-        for r, g, b, bit in training_data:
-            # Create the encoding and decoding circuits
+        for r, g, b, bit in data_batch:
             qc1 = create_encoding_circuit(encode_w, r, g, b, bit)
             qc2 = create_decoding_circuit(decode_w, r, g, b)
-            
-            # Combine both circuits
+
             combined = QuantumCircuit(qc1.num_qubits + qc2.num_qubits)
             combined.compose(qc1, qubits=range(qc1.num_qubits), inplace=True)
             combined.compose(qc2, qubits=range(qc1.num_qubits, qc1.num_qubits + qc2.num_qubits), inplace=True)
 
-            # Transpile and run the job
             transpiled = transpile(combined, backend_sim)
             job = backend_sim.run(transpiled, shots=shots, noise_model=noise_model)
             result = job.result()
             counts = result.get_counts()
-            bitstr = max(counts, key=counts.get)
-            output = 1 if bitstr[-1] == '1' else 0
-            bit_loss += (output - bit) ** 2
 
-        # Return the average loss over all training data
-        return bit_loss / len(training_data)
+            output_prob = counts.get('1', 0) / shots
+            bit_loss += (output_prob - bit) ** 2
 
-    # Initialize the optimizer (using SciPy's COBYLA as an example)
-    init_point = np.concatenate([encode_weights, decode_weights])
-    best_weights = init_point.copy()
-    best_loss = float("inf")
+        return bit_loss / len(data_batch)
 
-    # Optimization loop using scipy.optimize.minimize
-    for epoch in range(1, max_epochs + 1):
-        try:
-            # Optimize the loss function with SciPy's COBYLA (non-gradient-based)
-            result = minimize(loss, best_weights, method='COBYLA', options={'maxiter': 1})
+    for epoch in tqdm(range(1, max_epochs + 1), desc="Training Progress"):
+        full_data = shuffle(full_data)
+        batch = full_data[:batch_size]
 
-            # Extract new weights and loss value from the result
-            new_weights = result.x
-            loss_val = result.fun
+        # Learning rate scheduling via maxiter
+        maxiter = max(1, int(20 * (0.95 ** (epoch // 100))))
 
-            # Update best weights and loss if we found a better solution
-            if loss_val < best_loss:
-                best_loss = loss_val
-                best_weights = new_weights
+        result = minimize(loss, best_weights, args=(batch,), method='L-BFGS-B', options={'maxiter': maxiter})
+        new_weights = result.x
+        loss_val = result.fun
 
-            # Save the weights at specified intervals
-            if epoch % save_every == 0 or epoch == max_epochs:
-                np.save("encode_weights.npy", best_weights[:12])
-                np.save("decode_weights.npy", best_weights[12:])
-                logging.info(f"Epoch {epoch}: Loss={loss_val:.6f}")
-        
-        except Exception as e:
-            logging.error(f"Epoch {epoch} failed: {e}")
+        if loss_val < best_loss:
+            best_loss = loss_val
+            best_weights = new_weights
 
-    # Final save after training is complete
+        if epoch % save_every == 0 or epoch == max_epochs:
+            np.save("encode_weights.npy", best_weights[:12])
+            np.save("decode_weights.npy", best_weights[12:])
+            logging.warning(f"Epoch {epoch}: Loss={loss_val:.6f}")
+
     np.save("encode_weights.npy", best_weights[:12])
     np.save("decode_weights.npy", best_weights[12:])
-    logging.info("Training complete.")
+    logging.warning("Improved training complete.")
+
+
 
 # --- Backend job submission with retry and queue wait ---
 def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
@@ -188,7 +176,7 @@ def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
             
             # Execute the quantum circuits
             job = sampler.run(transpiled_circuits, shots=shots)
-            logging.info(f"Job submitted successfully on attempt {attempt + 1}")
+            logging.warning(f"Job submitted successfully on attempt {attempt + 1}")
             results = job.result()
 
             bitstream = ""
@@ -222,7 +210,7 @@ def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
             
             # If there are retries left, wait and try again
             if attempt < max_retries - 1:
-                logging.info(f"Waiting {wait_time}s before retrying...")
+                logging.warning(f"Waiting {wait_time}s before retrying...")
                 time.sleep(wait_time)
             else:
                 logging.error("Max retries reached. Returning None.")
@@ -234,12 +222,12 @@ def execute(circuits, backend, batch_size=20, shots=1024):
     total_circuits = len(circuits)
 
     qubit_list = list(range(circuits[0].num_qubits))
-    logging.info(f"Starting measurement calibration on {backend.name}...")
+    logging.warning(f"Starting measurement calibration on {backend.name}...")
     
     # Run circuits in batches
     for i in range(0, total_circuits, batch_size):
         batch = circuits[i:i + batch_size]
-        logging.info(f"Running batch {i // batch_size + 1} with {len(batch)} circuits...")
+        logging.warning(f"Running batch {i // batch_size + 1} with {len(batch)} circuits...")
         result = run_with_retry(backend, batch, shots=shots)
         if result is None:
             continue
@@ -289,7 +277,7 @@ def embed_bits(encode_weights, img, bits, backend):
     norm_pixels, alpha = image_to_normalized_pixels(img)
     circuits = prepare_embedding_circuits(encode_weights, norm_pixels, bits)
     
-    logging.info(f"Sending {len(circuits)} encoding circuits to backend {backend.name}...")
+    logging.warning(f"Sending {len(circuits)} encoding circuits to backend {backend.name}...")
     
     # Execute the circuits on the backend with mitigation
     bitstream = execute(circuits, backend)
@@ -321,7 +309,7 @@ def embed_bits(encode_weights, img, bits, backend):
 def decode_bits(decode_weights, img, n_bits, backend):
     norm_pixels, _ = image_to_normalized_pixels(img)
     circuits = prepare_decoding_circuits(decode_weights, norm_pixels, n_bits)
-    logging.info(f"Sending {len(circuits)} decoding circuits to backend {backend.name}...")
+    logging.warning(f"Sending {len(circuits)} decoding circuits to backend {backend.name}...")
     bitstream = execute(circuits, backend)
     bitstream_int = [int(bit) for bit in bitstream]
     return [1 if val > 0 else 0 for val in bitstream_int]
@@ -342,7 +330,7 @@ def main():
 
     encode_weights = np.load("encode_weights.npy")
     decode_weights = np.load("decode_weights.npy")
-    logging.info("Loaded trained model weights.")
+    logging.warning("Loaded trained model weights.")
 
     # Load cover image and secret file
     cover_img = Image.open("SpongeBob_SquarePants_character.jpg").convert("RGBA")
@@ -353,12 +341,12 @@ def main():
     if len(bits) > cover_img.width * cover_img.height:
         raise ValueError("Secret too large for the cover image.")
 
-    logging.info(f"Selected backend {backend.name} for embedding/decoding.")
+    logging.warning(f"Selected backend {backend.name} for embedding/decoding.")
 
     # Embed secret bits into the image using quantum encoding circuits
     stego_img = embed_bits(encode_weights, cover_img, bits, backend)
     stego_img.save("stego_image.png")
-    logging.info("Stego image saved as stego_image.png.")
+    logging.warning("Stego image saved as stego_image.png.")
 
     # Decode bits back from the stego image
     decoded_bits = decode_bits(decode_weights, stego_img, len(bits), backend)
@@ -369,7 +357,7 @@ def main():
     # Save recovered secret
     with open("recovered_secret.txt", "wb") as f:
         f.write(recovered_secret)
-    logging.info("Recovered secret saved as recovered_secret.txt.")
+    logging.warning("Recovered secret saved as recovered_secret.txt.")
 
 if __name__ == "__main__":
     main()
