@@ -14,71 +14,23 @@ from scipy.optimize import minimize
 from collections import Counter
 from tqdm import tqdm
 from sklearn.utils import shuffle
-import multiprocessing
-import warnings
+from multiprocessing.dummy import Pool as ThreadPool
+from qiskit.circuit import Parameter
+import nevergrad as ng
 
 service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_KEY_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
 #backend = service.least_busy(backend_filter=lambda b: b.num_qubits >= 5 and b.simulator is False and b.operational)
 
 backend = service.backend('ibm_sherbrooke')
 
-# Suppress the specific Qiskit Aer warning
-warnings.filterwarnings("ignore", message=".*has no QubitProperties.*thermal relaxation errors.*", category=UserWarning)
 
+# --- Shared Simulation Setup ---
+backend_sim = Aer.get_backend('aer_simulator')
+noise_model = NoiseModel.from_backend(backend_sim)
 
-# --- Quantum Circuit Builders ---
-def create_encoding_circuit(params, r, g, b, bit):
-    """
-    Encoding circuit: 4 qubits with parameterized rotations plus entangling gates,
-    embedding RGB and one bit.
-    """
-    qr = QuantumRegister(4)
-    qc = QuantumCircuit(qr)
-    # Embed normalized RGB as rotation angles
-    qc.rx(np.pi * r, qr[0])
-    qc.ry(np.pi * g, qr[1])
-    qc.rz(np.pi * b, qr[2])
-    # Embed the bit as RX rotation on last qubit
-    qc.rx(np.pi * bit, qr[3])
-
-    # Apply learned rotations from params
-    for i in range(4):
-        qc.rx(params[3 * i + 0], qr[i])
-        qc.ry(params[3 * i + 1], qr[i])
-        qc.rz(params[3 * i + 2], qr[i])
-
-    # Entangle qubits for encoding correlations
-    qc.cz(qr[0], qr[1])
-    qc.cz(qr[1], qr[2])
-    qc.cz(qr[2], qr[3])
-
-    qc.measure_all()
-    return qc
-
-def create_decoding_circuit(params, r, g, b):
-    """
-    Decoding circuit: 3 qubits, parameterized rotations plus entanglement,
-    used to decode bit from RGB-encoded qubits.
-    """
-    qr = QuantumRegister(3)
-    qc = QuantumCircuit(qr)
-    # Embed RGB info as rotations
-    qc.rx(np.pi * r, qr[0])
-    qc.ry(np.pi * g, qr[1])
-    qc.rz(np.pi * b, qr[2])
-
-    # Apply learned decoding rotations
-    for i in range(3):
-        qc.rx(params[3 * i + 0], qr[i])
-        qc.ry(params[3 * i + 1], qr[i])
-        qc.rz(params[3 * i + 2], qr[i])
-
-    # Entangling gates to decode correlations
-    qc.cz(qr[0], qr[1])
-    qc.cz(qr[1], qr[2])
-
-    qc.measure_all()
-    return qc
+# --- Parameterized Circuit Setup ---
+encode_params = [Parameter(f"e{i}") for i in range(12)]
+decode_params = [Parameter(f"d{i}") for i in range(9)]
 
 # --- Training Dataset Generation ---
 def generate_training_data(n_samples=500):
@@ -89,78 +41,116 @@ def generate_training_data(n_samples=500):
         data.append((r, g, b, bit))
     return data
 
-# --- Training ---
+def build_parameterized_encoding(r, g, b, bit):
+    qr = QuantumRegister(4)
+    qc = QuantumCircuit(qr)
+    qc.rx(np.pi * r, qr[0])
+    qc.ry(np.pi * g, qr[1])
+    qc.rz(np.pi * b, qr[2])
+    qc.rx(np.pi * bit, qr[3])
+
+    for i in range(4):
+        qc.rx(encode_params[3*i + 0], qr[i])
+        qc.ry(encode_params[3*i + 1], qr[i])
+        qc.rz(encode_params[3*i + 2], qr[i])
+
+    qc.cz(qr[0], qr[1])
+    qc.cz(qr[1], qr[2])
+    qc.cz(qr[2], qr[3])
+
+    return qc
+
+def build_parameterized_decoding(r, g, b):
+    qr = QuantumRegister(3)
+    qc = QuantumCircuit(qr)
+    qc.rx(np.pi * r, qr[0])
+    qc.ry(np.pi * g, qr[1])
+    qc.rz(np.pi * b, qr[2])
+
+    for i in range(3):
+        qc.rx(decode_params[3*i + 0], qr[i])
+        qc.ry(decode_params[3*i + 1], qr[i])
+        qc.rz(decode_params[3*i + 2], qr[i])
+
+    qc.cz(qr[0], qr[1])
+    qc.cz(qr[1], qr[2])
+
+    return qc
+
+def build_combined_bound_circuit(encode_w, decode_w, r, g, b, bit):
+    qc1 = build_parameterized_encoding(r, g, b, bit)
+    qc2 = build_parameterized_decoding(r, g, b)
+
+    combined = QuantumCircuit(qc1.num_qubits + qc2.num_qubits)
+    combined.compose(qc1, qubits=range(qc1.num_qubits), inplace=True)
+    combined.compose(qc2, qubits=range(qc1.num_qubits, combined.num_qubits), inplace=True)
+
+    param_dict = dict(zip(encode_params + decode_params,np.concatenate([encode_w, decode_w])))
+
+    bound_circuit = combined.assign_parameters(param_dict)
+    bound_circuit.measure_all()
+    return bound_circuit
+
+# --- Optimized Evaluation Function ---
 def evaluate_sample(args):
-        sample, encode_w, decode_w = args
-        r, g, b, bit = sample
+    sample, weights, shots = args
+    r, g, b, bit = sample
 
-        # Create a new backend and noise model for each subprocess
-        backend_sim = Aer.get_backend('aer_simulator')
-        noise_model = NoiseModel.from_backend(backend_sim)
-        shots = 256
+    # Ensure weights are split correctly even if misaligned
+    encode_w = weights[:12]
+    decode_w = weights[12:21]
 
-        qc1 = create_encoding_circuit(encode_w, r, g, b, bit)
-        qc2 = create_decoding_circuit(decode_w, r, g, b)
+    circuit = build_combined_bound_circuit(encode_w, decode_w, r, g, b, bit)
+    transpiled = transpile(circuit, backend_sim)
+    job = backend_sim.run(transpiled, shots=shots, noise_model=noise_model)
+    counts = job.result().get_counts()
+    prob = counts.get('1', 0) / shots
+    return (prob - bit) ** 2
 
-        combined = QuantumCircuit(qc1.num_qubits + qc2.num_qubits)
-        combined.compose(qc1, qubits=range(qc1.num_qubits), inplace=True)
-        combined.compose(qc2, qubits=range(qc1.num_qubits, qc1.num_qubits + qc2.num_qubits), inplace=True)
-
-        transpiled = transpile(combined, backend_sim)
-        job = backend_sim.run(transpiled, shots=shots, noise_model=noise_model)
-        result = job.result()
-        counts = result.get_counts()
-
-        output_prob = counts.get('1', 0) / shots
-        return (output_prob - bit) ** 2
-
-
-def train_offline_model(max_epochs=3000, batch_size=100, save_every=100):
-    print("Starting improved offline training with simulated backend...")
+# --- Optimized Training Loop ---
+def train_offline_model(max_epochs=3000, batch_size=100, save_every=100, shots=1024):
+    print("Starting accelerated training on simulator...")
 
     full_data = generate_training_data(n_samples=2000)
-
-    encode_weights = np.random.uniform(0, 2 * np.pi, 12)
-    decode_weights = np.random.uniform(0, 2 * np.pi, 9)
-    best_weights = np.concatenate([encode_weights, decode_weights])
+    weights = np.random.uniform(0, 2 * np.pi, len(encode_params) + len(decode_params))
     best_loss = float("inf")
 
     def loss(weights, data_batch):
-        encode_w = weights[:12]
-        decode_w = weights[12:]
+        # Flatten and force as NumPy array
+        weights = np.array(weights).flatten()
 
-        args_list = [(sample, encode_w, decode_w) for sample in data_batch]
-
-        with multiprocessing.Pool() as pool:
+        args_list = [(sample, weights, shots) for sample in data_batch]
+        with ThreadPool() as pool:
             losses = pool.map(evaluate_sample, args_list)
-
         return sum(losses) / len(losses)
+
+    # Create optimizer for the full dimensionality of weights
+    optimizer = ng.optimizers.SPSA(parametrization=len(encode_params) + len(decode_params), budget=max_epochs)
+
 
     for epoch in tqdm(range(1, max_epochs + 1), desc="Training Progress"):
         full_data = shuffle(full_data)
         batch = full_data[:batch_size]
 
-        # Learning rate scheduling
-        maxiter = max(1, int(20 * (0.95 ** (epoch // 100))))
+        # Ask for a candidate weights vector
+        candidate = optimizer.ask()
 
-        result = minimize(loss, best_weights, args=(batch,), method='L-BFGS-B',
-                          options={'maxiter': maxiter})
-        new_weights = result.x
-        loss_val = result.fun
+        # Evaluate loss on this candidate
+        candidate_loss = loss(candidate.value, batch)
 
-        if loss_val < best_loss:
-            best_loss = loss_val
-            best_weights = new_weights
+        # Tell optimizer the loss
+        optimizer.tell(candidate, candidate_loss)
+
+        if candidate_loss < best_loss:
+            best_loss = candidate_loss
+            weights = candidate.value
+            np.save("encode_weights.npy", weights[:12])
+            np.save("decode_weights.npy", weights[12:])
 
         if epoch % save_every == 0 or epoch == max_epochs:
-            np.save("encode_weights.npy", best_weights[:12])
-            np.save("decode_weights.npy", best_weights[12:])
-            print(f"Epoch {epoch}: Loss={loss_val:.6f}")
+            print(f"Epoch {epoch}: Loss = {candidate_loss:.6f}")
 
-    np.save("encode_weights.npy", best_weights[:12])
-    np.save("decode_weights.npy", best_weights[12:])
-    print("Improved training complete.")
-
+    print(f"Training complete. Final loss: {best_loss:.6f}")
 
 
 # --- Backend job submission with retry and queue wait ---
@@ -233,9 +223,6 @@ def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
 def execute(circuits, backend, batch_size=20, shots=1024):
     bitstream = ''
     total_circuits = len(circuits)
-
-    qubit_list = list(range(circuits[0].num_qubits))
-    print(f"Starting measurement calibration on {backend.name}...")
     
     # Run circuits in batches
     for i in range(0, total_circuits, batch_size):
