@@ -108,7 +108,7 @@ def evaluate_sample(args):
     return (prob - bit) ** 2
 
 # --- Optimized Training Loop ---
-def train_offline_model(max_epochs=3000, batch_size=100, save_every=100, shots=1024):
+def train_offline_model(max_epochs=5000, batch_size=100, save_every=100, shots=2048):
     print("Starting accelerated training on simulator...")
 
     full_data = generate_training_data(n_samples=2000)
@@ -255,7 +255,9 @@ def prepare_embedding_circuits(encode_weights, pixels, bits):
     for idx, bit in enumerate(bits):
         y, x = divmod(idx, pixels.shape[1])
         r, g, b = pixels[y, x]
-        qc = create_encoding_circuit(encode_weights, r, g, b, bit)
+        qc = build_parameterized_encoding(r, g, b, bit)
+        param_dict = {encode_params[i]: encode_weights[i] for i in range(len(encode_params))}
+        qc = qc.assign_parameters(param_dict)
         circuits.append(qc)
     return circuits
 
@@ -264,7 +266,9 @@ def prepare_decoding_circuits(decode_weights, pixels, n_bits):
     for idx in range(n_bits):
         y, x = divmod(idx, pixels.shape[1])
         r, g, b = pixels[y, x]
-        qc = create_decoding_circuit(decode_weights, r, g, b)
+        qc = build_parameterized_decoding(r, g, b)
+        param_dict = {decode_params[i]: decode_weights[i] for i in range(len(decode_params))}
+        qc = qc.assign_parameters(param_dict)
         circuits.append(qc)
     return circuits
 
