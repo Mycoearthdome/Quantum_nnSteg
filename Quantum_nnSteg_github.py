@@ -7,11 +7,9 @@ import logging
 from qiskit import QuantumCircuit, QuantumRegister, transpile
 from qiskit_aer import Aer
 from qiskit_experiments.library.characterization import LocalReadoutError
-from qiskit_experiments.framework import AnalysisResultData
+from qiskit_experiments.framework import ExperimentData
 from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
 from qiskit_aer.noise import NoiseModel
-from scipy.optimize import minimize
-from collections import Counter
 from tqdm import tqdm
 from sklearn.utils import shuffle
 from multiprocessing.dummy import Pool as ThreadPool
@@ -30,7 +28,7 @@ noise_model = NoiseModel.from_backend(backend_sim)
 
 # --- Parameterized Circuit Setup ---
 encode_params = [Parameter(f"e{i}") for i in range(12)]
-decode_params = [Parameter(f"d{i}") for i in range(9)]
+decode_params = [Parameter(f"d{i}") for i in range(12)]
 
 # --- Training Dataset Generation ---
 def generate_training_data(n_samples=500):
@@ -61,19 +59,21 @@ def build_parameterized_encoding(r, g, b, bit):
     return qc
 
 def build_parameterized_decoding(r, g, b):
-    qr = QuantumRegister(3)
+    qr = QuantumRegister(4)
     qc = QuantumCircuit(qr)
+    
     qc.rx(np.pi * r, qr[0])
     qc.ry(np.pi * g, qr[1])
     qc.rz(np.pi * b, qr[2])
 
-    for i in range(3):
+    for i in range(4):
         qc.rx(decode_params[3*i + 0], qr[i])
         qc.ry(decode_params[3*i + 1], qr[i])
         qc.rz(decode_params[3*i + 2], qr[i])
 
     qc.cz(qr[0], qr[1])
     qc.cz(qr[1], qr[2])
+    qc.cz(qr[2], qr[3])
 
     return qc
 
@@ -97,7 +97,7 @@ def evaluate_sample(args):
     r, g, b, bit = sample
 
     encode_w = weights[:12]
-    decode_w = weights[12:21]
+    decode_w = weights[12:]
 
     circuit = build_combined_bound_circuit(encode_w, decode_w, r, g, b, bit)
     transpiled = transpile(circuit, backend_sim)
@@ -162,67 +162,57 @@ def train_offline_model(max_epochs=5000, batch_size=100, save_every=100, shots=2
     print(f"Training complete. Final loss: {best_loss:.6f}")
 
 
+def get_measurement_fitter(backend, qubits, shots=1024):
+    """
+    Calibrates measurement error on specified qubits using Qiskit Experiments.
+    Returns a measurement fitter object that can be used to correct raw counts.
+    """
+    mem_exp = LocalReadoutError(backend=backend, qubits=qubits)
+    exp_data: ExperimentData = mem_exp.run(shots=shots)
+    exp_data.block_for_results()  # Wait for results to be available
+
+    fitter = exp_data.analysis_results("meas_cal_fitter").value
+    return fitter
+
 # --- Backend job submission with retry and queue wait ---
-def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
-    """
-    Runs the given list of quantum circuits with retries upon failure.
-    Transpiles each circuit for the specified backend before running.
-
-    Parameters:
-    - backend: The quantum backend to run the job on.
-    - circuits: A list of QuantumCircuit objects to be executed.
-    - shots: The number of shots to run for each circuit.
-    - max_retries: Maximum number of retry attempts in case of failure.
-    - wait_time: The time to wait between retries (in seconds).
-
-    Returns:
-    - result: The result object from the job or None if all retries fail.
-    """
+def run_with_retry(backend, circuits, meas_fitter, shots=1024, max_retries=5, wait_time=30):
     for attempt in range(max_retries):
         try:
-            # Transpile each circuit for the backend before running
             transpiled_circuits = [transpile(circuit, backend) for circuit in circuits]
-            
             # Create the sampler object
             sampler = Sampler(backend)
             
             # Execute the quantum circuits
             job = sampler.run(transpiled_circuits, shots=shots)
             print(f"Job submitted successfully on attempt {attempt + 1}")
-            results = job.result()
+            result = job.result()
+
+            # Get counts for each circuit
+            raw_counts_list = [result.get_counts(i) for i in range(len(circuits))]
+
+            # Apply measurement error mitigation if fitter is available
+            if meas_fitter:
+                mitigated_counts_list = [meas_fitter.filter(c) for c in raw_counts_list]
+            else:
+                mitigated_counts_list = raw_counts_list
 
             bitstream = ""
-
-            for i, pub_result in enumerate(results):
-                bit_array = pub_result.data.meas  # This is BitArray print(dir(bit_array)) #DEBUG
-
-                try:
-                    bitstrings = bit_array.get_bitstrings()
-
-                    if not bitstrings:
-                        print(f"No bitstrings for circuit {i}")
-                        continue
-
-                    # Count frequency of bitstrings
-                    most_common_str, _ = Counter(bitstrings).most_common(1)[0]
-                    
-                    # Extract measured bit from qr[3] (leftmost qubit in Qiskit)
-                    bitstream += most_common_str[0]
-
-
-                except Exception as e:
-                    logging.error(f"Failed to decode circuit {i}: {e}")
+            for i, counts in enumerate(mitigated_counts_list):
+                if not counts:
+                    print(f"No counts for circuit {i}")
                     continue
+
+                # Get most common measured bitstring
+                most_common_str = max(counts.items(), key=lambda x: x[1])[0]
+                # Read qubit 3 (4th qubit from right)
+                bitstream += most_common_str[-4]
 
             if not bitstream:
                 print("Bitstream is empty. All circuits failed?")
-
             return bitstream
-        
+
         except Exception as e:
             print(f"Run attempt {attempt + 1} failed: {e}")
-            
-            # If there are retries left, wait and try again
             if attempt < max_retries - 1:
                 print(f"Waiting {wait_time}s before retrying...")
                 time.sleep(wait_time)
@@ -231,15 +221,15 @@ def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
                 return None
 
 # --- Measurement Error Mitigation ---
-def execute(circuits, backend, batch_size=20, shots=1024):
+def execute(circuits, backend, qubits, batch_size=20, shots=1024):
     bitstream = ''
     total_circuits = len(circuits)
-    
+    meas_fitter = get_measurement_fitter(backend, qubits=qubits, shots=1024)
     # Run circuits in batches
     for i in range(0, total_circuits, batch_size):
         batch = circuits[i:i + batch_size]
         print(f"Running batch {i // batch_size + 1} with {len(batch)} circuits...")
-        result = run_with_retry(backend, batch, shots=shots)
+        result = run_with_retry(backend, batch, shots=shots, meas_fitter=meas_fitter)
         if result is None:
             continue
         bitstream += result
@@ -297,7 +287,7 @@ def embed_bits(encode_weights, img, bits, backend):
     print(f"Sending {len(circuits)} encoding circuits to backend {backend.name}...")
     
     # Execute the circuits on the backend with mitigation
-    bitstream = execute(circuits, backend)
+    bitstream = execute(circuits, backend, qubits=list(range(len(circuits))))
     
     # Process the result of each circuit to modify the image pixels
     for idx, bit in enumerate(bitstream):
@@ -327,7 +317,7 @@ def decode_bits(decode_weights, img, n_bits, backend):
     norm_pixels, _ = image_to_normalized_pixels(img)
     circuits = prepare_decoding_circuits(decode_weights, norm_pixels, n_bits)
     print(f"Sending {len(circuits)} decoding circuits to backend {backend.name}...")
-    bitstream = execute(circuits, backend)
+    bitstream = execute(circuits, backend, qubits=list(range(len(circuits))))
     bitstream_int = [int(bit) for bit in bitstream]
     return [1 if val > 0 else 0 for val in bitstream_int]
 
