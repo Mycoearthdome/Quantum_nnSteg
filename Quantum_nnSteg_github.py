@@ -12,13 +12,19 @@ from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
 from qiskit_aer.noise import NoiseModel
 from scipy.optimize import minimize
 from collections import Counter
+from tqdm import tqdm
+from sklearn.utils import shuffle
+import multiprocessing
+import warnings
 
 service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_KEY_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
 #backend = service.least_busy(backend_filter=lambda b: b.num_qubits >= 5 and b.simulator is False and b.operational)
 
 backend = service.backend('ibm_sherbrooke')
 
-logging.basicConfig(level=logging.WARNING)
+# Suppress the specific Qiskit Aer warning
+warnings.filterwarnings("ignore", message=".*has no QubitProperties.*thermal relaxation errors.*", category=UserWarning)
+
 
 # --- Quantum Circuit Builders ---
 def create_encoding_circuit(params, r, g, b, bit):
@@ -84,14 +90,33 @@ def generate_training_data(n_samples=500):
     return data
 
 # --- Training ---
-from tqdm import tqdm
-from sklearn.utils import shuffle
+def evaluate_sample(args):
+        sample, encode_w, decode_w = args
+        r, g, b, bit = sample
+
+        # Create a new backend and noise model for each subprocess
+        backend_sim = Aer.get_backend('aer_simulator')
+        noise_model = NoiseModel.from_backend(backend_sim)
+        shots = 256
+
+        qc1 = create_encoding_circuit(encode_w, r, g, b, bit)
+        qc2 = create_decoding_circuit(decode_w, r, g, b)
+
+        combined = QuantumCircuit(qc1.num_qubits + qc2.num_qubits)
+        combined.compose(qc1, qubits=range(qc1.num_qubits), inplace=True)
+        combined.compose(qc2, qubits=range(qc1.num_qubits, qc1.num_qubits + qc2.num_qubits), inplace=True)
+
+        transpiled = transpile(combined, backend_sim)
+        job = backend_sim.run(transpiled, shots=shots, noise_model=noise_model)
+        result = job.result()
+        counts = result.get_counts()
+
+        output_prob = counts.get('1', 0) / shots
+        return (output_prob - bit) ** 2
+
 
 def train_offline_model(max_epochs=3000, batch_size=100, save_every=100):
-    logging.warning("Starting improved offline training with simulated backend...")
-
-    backend_sim = Aer.get_backend('aer_simulator')
-    noise_model = NoiseModel.from_backend(backend_sim)
+    print("Starting improved offline training with simulated backend...")
 
     full_data = generate_training_data(n_samples=2000)
 
@@ -103,35 +128,23 @@ def train_offline_model(max_epochs=3000, batch_size=100, save_every=100):
     def loss(weights, data_batch):
         encode_w = weights[:12]
         decode_w = weights[12:]
-        bit_loss = 0.0
-        shots = 256
 
-        for r, g, b, bit in data_batch:
-            qc1 = create_encoding_circuit(encode_w, r, g, b, bit)
-            qc2 = create_decoding_circuit(decode_w, r, g, b)
+        args_list = [(sample, encode_w, decode_w) for sample in data_batch]
 
-            combined = QuantumCircuit(qc1.num_qubits + qc2.num_qubits)
-            combined.compose(qc1, qubits=range(qc1.num_qubits), inplace=True)
-            combined.compose(qc2, qubits=range(qc1.num_qubits, qc1.num_qubits + qc2.num_qubits), inplace=True)
+        with multiprocessing.Pool() as pool:
+            losses = pool.map(evaluate_sample, args_list)
 
-            transpiled = transpile(combined, backend_sim)
-            job = backend_sim.run(transpiled, shots=shots, noise_model=noise_model)
-            result = job.result()
-            counts = result.get_counts()
-
-            output_prob = counts.get('1', 0) / shots
-            bit_loss += (output_prob - bit) ** 2
-
-        return bit_loss / len(data_batch)
+        return sum(losses) / len(losses)
 
     for epoch in tqdm(range(1, max_epochs + 1), desc="Training Progress"):
         full_data = shuffle(full_data)
         batch = full_data[:batch_size]
 
-        # Learning rate scheduling via maxiter
+        # Learning rate scheduling
         maxiter = max(1, int(20 * (0.95 ** (epoch // 100))))
 
-        result = minimize(loss, best_weights, args=(batch,), method='L-BFGS-B', options={'maxiter': maxiter})
+        result = minimize(loss, best_weights, args=(batch,), method='L-BFGS-B',
+                          options={'maxiter': maxiter})
         new_weights = result.x
         loss_val = result.fun
 
@@ -142,11 +155,11 @@ def train_offline_model(max_epochs=3000, batch_size=100, save_every=100):
         if epoch % save_every == 0 or epoch == max_epochs:
             np.save("encode_weights.npy", best_weights[:12])
             np.save("decode_weights.npy", best_weights[12:])
-            logging.warning(f"Epoch {epoch}: Loss={loss_val:.6f}")
+            print(f"Epoch {epoch}: Loss={loss_val:.6f}")
 
     np.save("encode_weights.npy", best_weights[:12])
     np.save("decode_weights.npy", best_weights[12:])
-    logging.warning("Improved training complete.")
+    print("Improved training complete.")
 
 
 
@@ -176,7 +189,7 @@ def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
             
             # Execute the quantum circuits
             job = sampler.run(transpiled_circuits, shots=shots)
-            logging.warning(f"Job submitted successfully on attempt {attempt + 1}")
+            print(f"Job submitted successfully on attempt {attempt + 1}")
             results = job.result()
 
             bitstream = ""
@@ -188,7 +201,7 @@ def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
                     bitstrings = bit_array.get_bitstrings()
 
                     if not bitstrings:
-                        logging.warning(f"No bitstrings for circuit {i}")
+                        print(f"No bitstrings for circuit {i}")
                         continue
 
                     # Count frequency of bitstrings
@@ -201,16 +214,16 @@ def run_with_retry(backend, circuits, shots=1024, max_retries=5, wait_time=30):
                     continue
 
             if not bitstream:
-                logging.warning("Bitstream is empty. All circuits failed?")
+                print("Bitstream is empty. All circuits failed?")
 
             return bitstream
         
         except Exception as e:
-            logging.warning(f"Run attempt {attempt + 1} failed: {e}")
+            print(f"Run attempt {attempt + 1} failed: {e}")
             
             # If there are retries left, wait and try again
             if attempt < max_retries - 1:
-                logging.warning(f"Waiting {wait_time}s before retrying...")
+                print(f"Waiting {wait_time}s before retrying...")
                 time.sleep(wait_time)
             else:
                 logging.error("Max retries reached. Returning None.")
@@ -222,12 +235,12 @@ def execute(circuits, backend, batch_size=20, shots=1024):
     total_circuits = len(circuits)
 
     qubit_list = list(range(circuits[0].num_qubits))
-    logging.warning(f"Starting measurement calibration on {backend.name}...")
+    print(f"Starting measurement calibration on {backend.name}...")
     
     # Run circuits in batches
     for i in range(0, total_circuits, batch_size):
         batch = circuits[i:i + batch_size]
-        logging.warning(f"Running batch {i // batch_size + 1} with {len(batch)} circuits...")
+        print(f"Running batch {i // batch_size + 1} with {len(batch)} circuits...")
         result = run_with_retry(backend, batch, shots=shots)
         if result is None:
             continue
@@ -277,7 +290,7 @@ def embed_bits(encode_weights, img, bits, backend):
     norm_pixels, alpha = image_to_normalized_pixels(img)
     circuits = prepare_embedding_circuits(encode_weights, norm_pixels, bits)
     
-    logging.warning(f"Sending {len(circuits)} encoding circuits to backend {backend.name}...")
+    print(f"Sending {len(circuits)} encoding circuits to backend {backend.name}...")
     
     # Execute the circuits on the backend with mitigation
     bitstream = execute(circuits, backend)
@@ -309,7 +322,7 @@ def embed_bits(encode_weights, img, bits, backend):
 def decode_bits(decode_weights, img, n_bits, backend):
     norm_pixels, _ = image_to_normalized_pixels(img)
     circuits = prepare_decoding_circuits(decode_weights, norm_pixels, n_bits)
-    logging.warning(f"Sending {len(circuits)} decoding circuits to backend {backend.name}...")
+    print(f"Sending {len(circuits)} decoding circuits to backend {backend.name}...")
     bitstream = execute(circuits, backend)
     bitstream_int = [int(bit) for bit in bitstream]
     return [1 if val > 0 else 0 for val in bitstream_int]
@@ -330,7 +343,7 @@ def main():
 
     encode_weights = np.load("encode_weights.npy")
     decode_weights = np.load("decode_weights.npy")
-    logging.warning("Loaded trained model weights.")
+    print("Loaded trained model weights.")
 
     # Load cover image and secret file
     cover_img = Image.open("SpongeBob_SquarePants_character.jpg").convert("RGBA")
@@ -341,12 +354,12 @@ def main():
     if len(bits) > cover_img.width * cover_img.height:
         raise ValueError("Secret too large for the cover image.")
 
-    logging.warning(f"Selected backend {backend.name} for embedding/decoding.")
+    print(f"Selected backend {backend.name} for embedding/decoding.")
 
     # Embed secret bits into the image using quantum encoding circuits
     stego_img = embed_bits(encode_weights, cover_img, bits, backend)
     stego_img.save("stego_image.png")
-    logging.warning("Stego image saved as stego_image.png.")
+    print("Stego image saved as stego_image.png.")
 
     # Decode bits back from the stego image
     decoded_bits = decode_bits(decode_weights, stego_img, len(bits), backend)
@@ -357,7 +370,7 @@ def main():
     # Save recovered secret
     with open("recovered_secret.txt", "wb") as f:
         f.write(recovered_secret)
-    logging.warning("Recovered secret saved as recovered_secret.txt.")
+    print("Recovered secret saved as recovered_secret.txt.")
 
 if __name__ == "__main__":
     main()
