@@ -14,6 +14,8 @@ service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_KEY_HERE")
 
 backend = service.backend('ibm_sherbrooke') #ibm_brisbane
 
+BACKEND_MAX_CIRCUITS = 1000
+
 def build_bell_rgb_encoder(r, g, b, secret_bit):
     qr = QuantumRegister(2)
     qc = QuantumCircuit(qr)
@@ -124,21 +126,22 @@ def decode_bell_counts(counts_list):
     return bitstream            
 
 # --- Measurement Error Mitigation ---
-def execute(circuits, backend, qubits, batch_size=20, shots=1024):
+def execute(circuits, backend, shots=1024):
     bitstream = ''
-    total_circuits = len(circuits)
     meas_fitter = get_measurement_fitter(backend, shots=1024)
-    # Run circuits in batches
-    for i in range(0, total_circuits, batch_size):
-        batch = circuits[i:i + batch_size]
-        print(f"Running batch {i // batch_size + 1} with {len(batch)} circuits...")
-        result = run_with_retry(backend, batch, shots=shots, meas_fitter=meas_fitter)
-        if result is None:
-            continue
-        bitstream += result
+    
+    # Print out the total number of circuits to run
+    total_circuits = len(circuits)
+    print(f"Running {total_circuits} circuits in a single job...")
 
-        time.sleep(5)  # avoid flooding backend queue
-
+    # Try running the circuits in a single job
+    result = run_with_retry(backend, circuits, shots=shots, meas_fitter=meas_fitter)
+    
+    if result is None:
+        print("Failed to execute job. No result returned.")
+        return ''
+    
+    bitstream += result
     return bitstream
 
 # --- Image Normalization Functions ---
@@ -158,7 +161,7 @@ def embed_bits_bell(img, bits, backend):
     circuits = prepare_bell_circuits(norm_pixels, bits)
 
     print(f"Sending {len(circuits)} Bell-state encoding circuits to backend {backend.name}...")
-    bitstream = execute(circuits, backend, qubits=list(range(2)))
+    bitstream = execute(circuits, backend)
     
     # Process bitstream to alter image (same as original method)
     for idx, bit in enumerate(bitstream):
@@ -168,7 +171,7 @@ def embed_bits_bell(img, bits, backend):
 
     return normalized_pixels_to_image(norm_pixels, alpha)
 
-def decode_bits_bell_blind(img, backend):
+def decode_bits_bell_blind(img, backend, shots=1024):
     norm_pixels, _ = image_to_normalized_pixels(img)
     height, width, _ = norm_pixels.shape
     decoded_bits = []
@@ -187,7 +190,7 @@ def decode_bits_bell_blind(img, backend):
             transpiled = transpile(circuits, backend)
 
             sampler = Sampler(backend=backend)
-            result = sampler.run(transpiled, shots=512).result()
+            result = sampler.run(transpiled, shots=shots).result()
 
             scores = []
             for pub_result in result:
@@ -225,12 +228,18 @@ def bits_to_bytes(bits):
 def main():
     # Load cover image and secret file
     cover_img = Image.open("SpongeBob_SquarePants_character.jpg").convert("RGBA")
+
+    # Resize the cover image to 20x20 (decoding to stay below max_circuits = 1000 (IBM_QUANTUM hardware limitations))
+    cover_img = cover_img.resize((20, 20), Image.ANTIALIAS)
+
     with open("secret.txt", "rb") as f:
         secret = f.read()
 
+    MAX_SECRET_SIZE = BACKEND_MAX_CIRCUITS - 2 * (cover_img.width * cover_img.height)
+
     bits = bytes_to_bits(secret)
     if len(bits) > cover_img.width * cover_img.height:
-        raise ValueError("Secret too large for the cover image.")
+        raise ValueError(f"Secret too large for the cover image. MAX secret characters = {MAX_SECRET_SIZE}")
 
     print(f"Selected backend {backend.name} for embedding/decoding.")
 
