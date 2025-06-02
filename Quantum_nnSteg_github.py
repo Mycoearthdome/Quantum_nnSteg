@@ -10,164 +10,54 @@ from qiskit_experiments.library.characterization import LocalReadoutError
 from qiskit_experiments.framework import ExperimentData
 from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
 from qiskit_aer.noise import NoiseModel
-from tqdm import tqdm
-from sklearn.utils import shuffle
-from multiprocessing.dummy import Pool as ThreadPool
 from qiskit.circuit import Parameter
-import nevergrad as ng
+from collections import Counter
 
 service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_KEY_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
 #backend = service.least_busy(backend_filter=lambda b: b.num_qubits >= 5 and b.simulator is False and b.operational)
 
-backend = service.backend('ibm_sherbrooke')
+backend = service.backend('ibm_brisbane') #ibm_sherbrooke
 
 
 # --- Shared Simulation Setup ---
 backend_sim = Aer.get_backend('aer_simulator')
 noise_model = NoiseModel.from_backend(backend_sim)
 
-# --- Parameterized Circuit Setup ---
-encode_params = [Parameter(f"e{i}") for i in range(12)]
-decode_params = [Parameter(f"d{i}") for i in range(12)]
-
-# --- Training Dataset Generation ---
-def generate_training_data(n_samples=500):
-    data = []
-    for _ in range(n_samples):
-        r, g, b = np.random.uniform(0, 1, 3)
-        bit = np.random.randint(0, 2)
-        data.append((r, g, b, bit))
-    return data
-
-def build_parameterized_encoding(r, g, b, bit):
-    qr = QuantumRegister(4)
+def build_bell_rgb_encoder(r, g, b, secret_bit):
+    qr = QuantumRegister(2)
     qc = QuantumCircuit(qr)
+
+    if secret_bit == 1:
+        qc.x(qr[1])  # Create |Ψ+> from |00>
+
+    qc.h(qr[0])
+    qc.cx(qr[0], qr[1])
+
+    # Optional RGB encoding (can skip if you want minimal disturbance)
     qc.rx(np.pi * r, qr[0])
     qc.ry(np.pi * g, qr[1])
-    qc.rz(np.pi * b, qr[2])
-    qc.rx(np.pi * bit, qr[3])
+    qc.rz(np.pi * b, qr[0])
 
-    for i in range(4):
-        qc.rx(encode_params[3*i + 0], qr[i])
-        qc.ry(encode_params[3*i + 1], qr[i])
-        qc.rz(encode_params[3*i + 2], qr[i])
-
-    qc.cz(qr[0], qr[1])
-    qc.cz(qr[1], qr[2])
-    qc.cz(qr[2], qr[3])
-
+    qc.barrier()
+    qc.measure_all()
     return qc
 
-def build_parameterized_decoding(r, g, b):
-    qr = QuantumRegister(4)
-    qc = QuantumCircuit(qr)
-    
-    qc.rx(np.pi * r, qr[0])
-    qc.ry(np.pi * g, qr[1])
-    qc.rz(np.pi * b, qr[2])
-
-    for i in range(4):
-        qc.rx(decode_params[3*i + 0], qr[i])
-        qc.ry(decode_params[3*i + 1], qr[i])
-        qc.rz(decode_params[3*i + 2], qr[i])
-
-    qc.cz(qr[0], qr[1])
-    qc.cz(qr[1], qr[2])
-    qc.cz(qr[2], qr[3])
-
-    return qc
-
-def build_combined_bound_circuit(encode_w, decode_w, r, g, b, bit):
-    qc1 = build_parameterized_encoding(r, g, b, bit)
-    qc2 = build_parameterized_decoding(r, g, b)
-
-    combined = QuantumCircuit(qc1.num_qubits + qc2.num_qubits)
-    combined.compose(qc1, qubits=range(qc1.num_qubits), inplace=True)
-    combined.compose(qc2, qubits=range(qc1.num_qubits, combined.num_qubits), inplace=True)
-
-    param_dict = dict(zip(encode_params + decode_params,np.concatenate([encode_w, decode_w])))
-
-    bound_circuit = combined.assign_parameters(param_dict)
-    bound_circuit.measure_all()
-    return bound_circuit
-
-# --- Optimized Evaluation Function ---
-def evaluate_sample(args):
-    sample, weights, shots = args
-    r, g, b, bit = sample
-
-    encode_w = weights[:12]
-    decode_w = weights[12:]
-
-    circuit = build_combined_bound_circuit(encode_w, decode_w, r, g, b, bit)
-    transpiled = transpile(circuit, backend_sim)
-    job = backend_sim.run(transpiled, shots=shots, noise_model=noise_model)
-    counts = job.result().get_counts()
-
-    total_error = 0
-    total_bits = 0
-
-    for bitstring, count in counts.items():
-        for i in range(len(bitstring)):
-            measured_bit = int(bitstring[-(i + 1)])  # Qiskit bit order: q_0 is rightmost
-            error = (measured_bit - bit) ** 2
-            total_error += error * count
-            total_bits += count
-
-    return total_error / total_bits
-
-# --- Optimized Training Loop ---
-def train_offline_model(max_epochs=5000, batch_size=100, save_every=100, shots=2048):
-    print("Starting accelerated training on simulator...")
-
-    full_data = generate_training_data(n_samples=2000)
-    weights = np.random.uniform(0, 2 * np.pi, len(encode_params) + len(decode_params))
-    best_loss = float("inf")
-
-    def loss(weights, data_batch):
-        # Flatten and force as NumPy array
-        weights = np.array(weights).flatten()
-
-        args_list = [(sample, weights, shots) for sample in data_batch]
-        with ThreadPool() as pool:
-            losses = pool.map(evaluate_sample, args_list)
-        return sum(losses) / len(losses)
-
-    # Create optimizer for the full dimensionality of weights
-    optimizer = ng.optimizers.SPSA(parametrization=len(encode_params) + len(decode_params), budget=max_epochs)
+def prepare_bell_circuits(pixels, bits):
+    circuits = []
+    for idx, bit in enumerate(bits):
+        y, x = divmod(idx, pixels.shape[1])
+        r, g, b = pixels[y, x]
+        qc = build_bell_rgb_encoder(r, g, b, bit)
+        circuits.append(qc)
+    return circuits
 
 
-    for epoch in tqdm(range(1, max_epochs + 1), desc="Training Progress"):
-        full_data = shuffle(full_data)
-        batch = full_data[:batch_size]
-
-        # Ask for a candidate weights vector
-        candidate = optimizer.ask()
-
-        # Evaluate loss on this candidate
-        candidate_loss = loss(candidate.value, batch)
-
-        # Tell optimizer the loss
-        optimizer.tell(candidate, candidate_loss)
-
-        if candidate_loss < best_loss:
-            best_loss = candidate_loss
-            weights = candidate.value
-            np.save("encode_weights.npy", weights[:12])
-            np.save("decode_weights.npy", weights[12:])
-
-        if epoch % save_every == 0 or epoch == max_epochs:
-            print(f"Epoch {epoch}: Loss = {candidate_loss:.6f}")
-
-    print(f"Training complete. Final loss: {best_loss:.6f}")
-
-
-def get_measurement_fitter(backend, qubits, shots=1024):
+def get_measurement_fitter(backend, shots=1024):
     """
-    Calibrates measurement error on specified qubits using Qiskit Experiments.
+    Calibrates measurement error using Qiskit Experiments.
     Returns a measurement fitter object that can be used to correct raw counts.
     """
-    mem_exp = LocalReadoutError(backend=backend, qubits=qubits)
+    mem_exp = LocalReadoutError(backend=backend)
     exp_data: ExperimentData = mem_exp.run(shots=shots)
     exp_data.block_for_results()  # Wait for results to be available
 
@@ -175,37 +65,45 @@ def get_measurement_fitter(backend, qubits, shots=1024):
     return fitter
 
 # --- Backend job submission with retry and queue wait ---
-def run_with_retry(backend, circuits, meas_fitter, shots=1024, max_retries=5, wait_time=30):
+def run_with_retry(backend, circuits, meas_fitter=None, shots=1024, max_retries=5, wait_time=30):
     for attempt in range(max_retries):
         try:
-            transpiled_circuits = [transpile(circuit, backend) for circuit in circuits]
-            # Create the sampler object
-            sampler = Sampler(backend)
-            
-            # Execute the quantum circuits
+            transpiled_circuits = transpile(circuits, backend)
+            sampler = Sampler(backend=backend)
             job = sampler.run(transpiled_circuits, shots=shots)
             print(f"Job submitted successfully on attempt {attempt + 1}")
-            result = job.result()
-
-            # Get counts for each circuit
-            raw_counts_list = [result.get_counts(i) for i in range(len(circuits))]
-
-            # Apply measurement error mitigation if fitter is available
-            if meas_fitter:
-                mitigated_counts_list = [meas_fitter.filter(c) for c in raw_counts_list]
-            else:
-                mitigated_counts_list = raw_counts_list
+            results = job.result()
 
             bitstream = ""
-            for i, counts in enumerate(mitigated_counts_list):
-                if not counts:
-                    print(f"No counts for circuit {i}")
-                    continue
 
-                # Get most common measured bitstring
-                most_common_str = max(counts.items(), key=lambda x: x[1])[0]
-                # Read qubit 3 (4th qubit from right)
-                bitstream += most_common_str[-4]
+            for i, pub_result in enumerate(results):
+
+                bit_array = pub_result.data.meas  # This is BitArray print(dir(bit_array)) #DEBUG
+
+                try:
+                    bitstrings = bit_array.get_bitstrings()
+
+                    if not bitstrings:
+                        print(f"No bitstrings for circuit {i}")
+                        continue
+
+                    #Pseudo-Counts
+                    bitstrings_counts = Counter(bitstrings)
+
+                    # Apply measurement error mitigation if fitter is provided
+                    mitigated_bitstrings = meas_fitter.filter(bitstrings_counts) if meas_fitter else bitstrings_counts
+
+                    # Pick most common bitstring
+                    most_common_str = max(mitigated_bitstrings.items(), key=lambda x: x[1])[0]
+
+                    # Read bit from appropriate qubit (adjust qubit index as needed)
+                    encoded_bit_index = 1
+                    bitstream += most_common_str[-(encoded_bit_index + 1)]
+
+
+                except Exception as e:
+                    logging.error(f"Failed to decode circuit {i}: {e}")
+                    continue
 
             if not bitstream:
                 print("Bitstream is empty. All circuits failed?")
@@ -220,11 +118,25 @@ def run_with_retry(backend, circuits, meas_fitter, shots=1024, max_retries=5, wa
                 logging.error("Max retries reached. Returning None.")
                 return None
 
+            
+def decode_bell_counts(counts_list):
+    bitstream = ""
+    for counts in counts_list:
+        if not counts:
+            bitstream += "0"
+            continue
+        most_common = max(counts.items(), key=lambda x: x[1])[0]
+        if most_common in ["00", "11"]:
+            bitstream += "0"
+        else:
+            bitstream += "1"
+    return bitstream            
+
 # --- Measurement Error Mitigation ---
 def execute(circuits, backend, qubits, batch_size=20, shots=1024):
     bitstream = ''
     total_circuits = len(circuits)
-    meas_fitter = get_measurement_fitter(backend, qubits=qubits, shots=1024)
+    meas_fitter = get_measurement_fitter(backend, shots=1024)
     # Run circuits in batches
     for i in range(0, total_circuits, batch_size):
         batch = circuits[i:i + batch_size]
@@ -250,76 +162,35 @@ def normalized_pixels_to_image(norm_pixels, alpha_channel):
     rgba = np.dstack((pixels, alpha_channel))
     return Image.fromarray(rgba, mode='RGBA')
 
-# --- Prepare Circuits ---
-def prepare_embedding_circuits(encode_weights, pixels, bits):
-    circuits = []
-    for idx, bit in enumerate(bits):
-        y, x = divmod(idx, pixels.shape[1])
-        r, g, b = pixels[y, x]
-        qc = build_parameterized_encoding(r, g, b, bit)
-        param_dict = {encode_params[i]: encode_weights[i] for i in range(len(encode_params))}
-        qc = qc.assign_parameters(param_dict)
-        qc.measure_all() 
-        circuits.append(qc)
-    return circuits
-
-def prepare_decoding_circuits(decode_weights, pixels, n_bits):
-    circuits = []
-    for idx in range(n_bits):
-        y, x = divmod(idx, pixels.shape[1])
-        r, g, b = pixels[y, x]
-        qc = build_parameterized_decoding(r, g, b)
-        param_dict = {decode_params[i]: decode_weights[i] for i in range(len(decode_params))}
-        qc = qc.assign_parameters(param_dict)
-        qc.measure_all() 
-        circuits.append(qc)
-    return circuits
-
-def embed_bits(encode_weights, img, bits, backend):
-    """
-    Embed secret bits into the image using quantum encoding circuits.
-    Each bit is encoded into the quantum state of the image pixels.
-    """
-    # Convert image to normalized pixel values (RGB)
+def embed_bits_bell(img, bits, backend):
     norm_pixels, alpha = image_to_normalized_pixels(img)
-    circuits = prepare_embedding_circuits(encode_weights, norm_pixels, bits)
+    circuits = prepare_bell_circuits(norm_pixels, bits)
+
+    print(f"Sending {len(circuits)} Bell-state encoding circuits to backend {backend.name}...")
+    bitstream = execute(circuits, backend, qubits=list(range(2)))
     
-    print(f"Sending {len(circuits)} encoding circuits to backend {backend.name}...")
-    
-    # Execute the circuits on the backend with mitigation
-    bitstream = execute(circuits, backend, qubits=list(range(len(circuits))))
-    
-    # Process the result of each circuit to modify the image pixels
+    # Process bitstream to alter image (same as original method)
     for idx, bit in enumerate(bitstream):
         y, x = divmod(idx, norm_pixels.shape[1])
-        
-        # Assuming each pixel corresponds to one quantum circuit (RGB values)
-        # Extract the quantum measurement result (0 or 1)
-        if bit == "1":  # If '1' was measured in the quantum circuit
-            result_bit = 1
-        else:
-            result_bit = 0
-        
-        # Use the quantum result to encode the bit into the image
-        # Modify the pixel value based on the result: shift or slightly adjust color channels
-        if result_bit == 1:
-            # Example: Adjust red channel if the encoded bit is 1
-            norm_pixels[y, x, 0] = min(1.0, norm_pixels[y, x, 0] + 0.05)  # Increase red channel
-        else:
-            # If the encoded bit is 0, leave the pixel unaltered or slightly reduce red
-            norm_pixels[y, x, 0] = max(0.0, norm_pixels[y, x, 0] - 0.05)  # Decrease red channel
+        result_bit = int(bit)
+        norm_pixels[y, x, 0] = min(1.0, norm_pixels[y, x, 0] + 0.05) if result_bit else max(0.0, norm_pixels[y, x, 0] - 0.05)
 
-    # Convert back to image
     return normalized_pixels_to_image(norm_pixels, alpha)
 
-# --- Decode Bits from Image ---
-def decode_bits(decode_weights, img, n_bits, backend):
+def decode_bits_bell(img, bits, backend):
     norm_pixels, _ = image_to_normalized_pixels(img)
-    circuits = prepare_decoding_circuits(decode_weights, norm_pixels, n_bits)
-    print(f"Sending {len(circuits)} decoding circuits to backend {backend.name}...")
-    bitstream = execute(circuits, backend, qubits=list(range(len(circuits))))
-    bitstream_int = [int(bit) for bit in bitstream]
-    return [1 if val > 0 else 0 for val in bitstream_int]
+    circuits = prepare_bell_circuits(norm_pixels, bits)
+    print(f"Sending {len(circuits)} Bell-state decoding circuits to backend {backend.name}...")
+    meas_fitter = get_measurement_fitter(backend)
+    raw_counts = []
+    for i in range(0, len(circuits), 20):
+        batch = circuits[i:i+20]
+        result = run_with_retry(backend, batch, shots=1024, meas_fitter=meas_fitter)
+        if result:
+            raw_counts.extend(result)
+        time.sleep(3)
+
+    return [int(bit) for bit in raw_counts]
 
 # --- Bit/Byte Conversions ---
 def bytes_to_bits(data):
@@ -330,15 +201,6 @@ def bits_to_bytes(bits):
 
 # --- Main ---
 def main():
-    # Load trained weights
-    if not (os.path.exists("encode_weights.npy") and os.path.exists("decode_weights.npy")):
-         # Train model offline on simulator with noise (reduce epochs for testing)
-        train_offline_model() #1000-3000 max_epochs hopefully.
-
-    encode_weights = np.load("encode_weights.npy")
-    decode_weights = np.load("decode_weights.npy")
-    print("Loaded trained model weights.")
-
     # Load cover image and secret file
     cover_img = Image.open("SpongeBob_SquarePants_character.jpg").convert("RGBA")
     with open("secret.txt", "rb") as f:
@@ -350,13 +212,12 @@ def main():
 
     print(f"Selected backend {backend.name} for embedding/decoding.")
 
-    # Embed secret bits into the image using quantum encoding circuits
-    stego_img = embed_bits(encode_weights, cover_img, bits, backend)
-    stego_img.save("stego_image.png")
-    print("Stego image saved as stego_image.png.")
+    # stego_img = embed_bits(encode_weights, decode_weights, cover_img, bits, backend)
+    stego_img = embed_bits_bell(cover_img, bits, backend)
+    stego_img.save("stego_image_bell.png")
 
-    # Decode bits back from the stego image
-    decoded_bits = decode_bits(decode_weights, stego_img, len(bits), backend)
+    # decoded_bits = decode_bits(encode_weights, decode_weights, stego_img, bits, backend)
+    decoded_bits = decode_bits_bell(stego_img, bits, backend)
 
     # Convert bits to bytes
     recovered_secret = bits_to_bytes(decoded_bits)
