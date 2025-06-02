@@ -230,7 +230,7 @@ def main():
     cover_img = Image.open("SpongeBob_SquarePants_character.jpg").convert("RGBA")
 
     # Resize the cover image to 20x20 (decoding to stay below max_circuits = 1000 (IBM_QUANTUM hardware limitations))
-    cover_img = cover_img.resize((20, 20), Image.ANTIALIAS)
+    cover_img = cover_img.resize((20, 20))
 
     with open("secret.txt", "rb") as f:
         secret = f.read()
@@ -238,7 +238,7 @@ def main():
     MAX_SECRET_SIZE = BACKEND_MAX_CIRCUITS - 2 * (cover_img.width * cover_img.height)
 
     bits = bytes_to_bits(secret)
-    if len(bits) > cover_img.width * cover_img.height:
+    if len(bits) > (8*(2*(cover_img.width * cover_img.height))):
         raise ValueError(f"Secret too large for the cover image. MAX secret characters = {MAX_SECRET_SIZE}")
 
     print(f"Selected backend {backend.name} for embedding/decoding.")
