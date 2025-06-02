@@ -192,6 +192,53 @@ def decode_bits_bell(img, bits, backend):
 
     return [int(bit) for bit in raw_counts]
 
+
+def decode_bits_bell_blind(img, backend):
+    norm_pixels, _ = image_to_normalized_pixels(img)
+    height, width, _ = norm_pixels.shape
+    decoded_bits = []
+
+    print(f"Running blind decoding on {height * width} pixels using backend {backend.name}...")
+
+    for y in range(height):
+        for x in range(width):
+            r, g, b = norm_pixels[y, x]
+
+            # Generate both versions of the circuit
+            qc0 = build_bell_rgb_encoder(r, g, b, secret_bit=0)
+            qc1 = build_bell_rgb_encoder(r, g, b, secret_bit=1)
+
+            circuits = [qc0, qc1]
+            transpiled = transpile(circuits, backend)
+
+            sampler = Sampler(backend=backend)
+            result = sampler.run(transpiled, shots=512).result()
+
+            scores = []
+            for pub_result in result:
+                bit_array = pub_result.data.meas
+                bitstrings = bit_array.get_bitstrings()
+
+                if not bitstrings:
+                    scores.append(0)
+                    continue
+
+                counts = Counter(bitstrings)
+                # Score: count of entangled-like outputs ("00"/"11" for 0, "01"/"10" for 1)
+                score = counts["00"] + counts["11"]
+                scores.append(score)
+
+            if scores[1] > scores[0]:
+                decoded_bits.append(1)
+            else:
+                decoded_bits.append(0)
+
+            # Optional sleep to avoid spamming
+            time.sleep(0.1)
+
+    return decoded_bits
+
+
 # --- Bit/Byte Conversions ---
 def bytes_to_bits(data):
     return [(byte >> i) & 1 for byte in data for i in reversed(range(8))]
@@ -217,7 +264,8 @@ def main():
     stego_img.save("stego_image_bell.png")
 
     # decoded_bits = decode_bits(encode_weights, decode_weights, stego_img, bits, backend)
-    decoded_bits = decode_bits_bell(stego_img, bits, backend)
+    #decoded_bits = decode_bits_bell(stego_img, bits, backend)
+    decoded_bits = decode_bits_bell_blind(stego_img, backend)
 
     # Convert bits to bytes
     recovered_secret = bits_to_bytes(decoded_bits)
