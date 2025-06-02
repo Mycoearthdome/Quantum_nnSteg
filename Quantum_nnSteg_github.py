@@ -1,27 +1,18 @@
 import numpy as np
 from PIL import Image
-import os
 import time
 import logging
 
 from qiskit import QuantumCircuit, QuantumRegister, transpile
-from qiskit_aer import Aer
 from qiskit_experiments.library.characterization import LocalReadoutError
 from qiskit_experiments.framework import ExperimentData
 from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
-from qiskit_aer.noise import NoiseModel
-from qiskit.circuit import Parameter
 from collections import Counter
 
-service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_KEY_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
+service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_EY_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
 #backend = service.least_busy(backend_filter=lambda b: b.num_qubits >= 5 and b.simulator is False and b.operational)
 
-backend = service.backend('ibm_brisbane') #ibm_sherbrooke
-
-
-# --- Shared Simulation Setup ---
-backend_sim = Aer.get_backend('aer_simulator')
-noise_model = NoiseModel.from_backend(backend_sim)
+backend = service.backend('ibm_sherbrooke') #ibm_brisbane
 
 def build_bell_rgb_encoder(r, g, b, secret_bit):
     qr = QuantumRegister(2)
@@ -177,22 +168,6 @@ def embed_bits_bell(img, bits, backend):
 
     return normalized_pixels_to_image(norm_pixels, alpha)
 
-def decode_bits_bell(img, bits, backend):
-    norm_pixels, _ = image_to_normalized_pixels(img)
-    circuits = prepare_bell_circuits(norm_pixels, bits)
-    print(f"Sending {len(circuits)} Bell-state decoding circuits to backend {backend.name}...")
-    meas_fitter = get_measurement_fitter(backend)
-    raw_counts = []
-    for i in range(0, len(circuits), 20):
-        batch = circuits[i:i+20]
-        result = run_with_retry(backend, batch, shots=1024, meas_fitter=meas_fitter)
-        if result:
-            raw_counts.extend(result)
-        time.sleep(3)
-
-    return [int(bit) for bit in raw_counts]
-
-
 def decode_bits_bell_blind(img, backend):
     norm_pixels, _ = image_to_normalized_pixels(img)
     height, width, _ = norm_pixels.shape
@@ -264,7 +239,6 @@ def main():
     stego_img.save("stego_image_bell.png")
 
     # decoded_bits = decode_bits(encode_weights, decode_weights, stego_img, bits, backend)
-    #decoded_bits = decode_bits_bell(stego_img, bits, backend)
     decoded_bits = decode_bits_bell_blind(stego_img, backend)
 
     # Convert bits to bytes
