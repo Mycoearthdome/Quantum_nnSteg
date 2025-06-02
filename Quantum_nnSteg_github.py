@@ -9,7 +9,7 @@ from qiskit_experiments.framework import ExperimentData
 from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
 from collections import Counter
 
-service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_EY_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
+service = QiskitRuntimeService(channel="ibm_quantum", token="YOUR_API_KEY_HERE") # "ibm_quantum" becomes "ibm_cloud", "ibm_quantum_platform" after 1st July 2025
 #backend = service.least_busy(backend_filter=lambda b: b.num_qubits >= 5 and b.simulator is False and b.operational)
 
 backend = service.backend('ibm_sherbrooke') #ibm_brisbane
