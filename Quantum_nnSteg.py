@@ -75,39 +75,61 @@ def bits_to_bytes(bits):
 def xor_bits(bits1, bits2):
     return [int(b1) ^ int(b2) for b1, b2 in zip(bits1, bits2)]
 
-def embed_lsb_rgb(image, bits):
+def embed_lsb_rgb_random(image, bits, password):
     img = image.copy().convert("RGBA")
-    pixels = np.asarray(img, dtype=np.uint8).copy()
-    height, width = pixels.shape[:2]
+    pixels = np.array(img).copy()
     flat_pixels = pixels.reshape(-1, 4)
-    num_pixels_needed = (len(bits) + 2) // 3
-    if num_pixels_needed > len(flat_pixels):
-        raise ValueError("Not enough pixels to embed all bits.")
-    bit_idx = 0
-    for idx in range(num_pixels_needed):
-        r_bit = bits[bit_idx] if bit_idx < len(bits) else 0
-        g_bit = bits[bit_idx + 1] if bit_idx + 1 < len(bits) else 0
-        b_bit = bits[bit_idx + 2] if bit_idx + 2 < len(bits) else 0
-        bit_idx += 3
-        rgb = flat_pixels[idx, :3]
-        rgb &= 0xFE
-        rgb |= np.array([r_bit, g_bit, b_bit], dtype=np.uint8)
-        flat_pixels[idx, :3] = rgb
-    pixels = flat_pixels.reshape((height, width, 4))
-    return Image.fromarray(pixels, mode='RGBA')
 
-def extract_lsb_rgb(image, num_bits):
+    total_bits = len(bits)
+    total_pixels_needed = (total_bits + 2) // 3
+    if total_pixels_needed > len(flat_pixels):
+        raise ValueError("Not enough pixels")
+
+    # Deterministic shuffle
+    seed = int(hashlib.sha256(password.encode()).hexdigest(), 16)
+    rng = np.random.default_rng(seed)
+    pixel_indices = rng.permutation(len(flat_pixels))
+
+    bit_idx = 0
+    for idx in pixel_indices[:total_pixels_needed]:
+        r_bit = bits[bit_idx] if bit_idx < total_bits else 0
+        g_bit = bits[bit_idx + 1] if bit_idx + 1 < total_bits else 0
+        b_bit = bits[bit_idx + 2] if bit_idx + 2 < total_bits else 0
+        bit_idx += 3
+
+        rgb = flat_pixels[idx, :3]
+        rgb = (rgb & 0xFE) | np.array([r_bit, g_bit, b_bit], dtype=np.uint8)
+        flat_pixels[idx, :3] = rgb
+
+    return Image.fromarray(flat_pixels.reshape(pixels.shape), mode='RGBA')
+
+def extract_lsb_rgb_random(image, password):
     pixels = np.array(image)
     flat_pixels = pixels.reshape(-1, 4)
-    bits = []
-    for idx in range(len(flat_pixels)):
-        if len(bits) >= num_bits:
-            break
-        r_bit = flat_pixels[idx][0] & 1
-        g_bit = flat_pixels[idx][1] & 1
-        b_bit = flat_pixels[idx][2] & 1
-        bits.extend([r_bit, g_bit, b_bit])
-    return bits[:num_bits]
+
+    seed = int(hashlib.sha256(password.encode()).hexdigest(), 16)
+    rng = np.random.default_rng(seed)
+    pixel_indices = rng.permutation(len(flat_pixels))
+
+    def get_bits_from_pixels(indices, count):
+        bits = []
+        for idx in indices:
+            r, g, b = flat_pixels[idx][:3]
+            bits.extend([r & 1, g & 1, b & 1])
+            if len(bits) >= count:
+                return bits[:count]
+        return bits
+
+    # Step 1: Get header
+    header_bits = get_bits_from_pixels(pixel_indices, 28)
+    length_decoded = decode_bits(header_bits)[:16]
+    num_blocks = sum(int(b) << (15 - i) for i, b in enumerate(length_decoded))
+    total_bits = 28 + num_blocks * 7
+
+    # Step 2: Get total payload
+    payload_bits = get_bits_from_pixels(pixel_indices, total_bits)
+    return payload_bits
+
 
 def encode_bits(data_bits):
     encoded_bits = []
@@ -161,7 +183,7 @@ def decode_with_length(encoded_bits):
 
 def decode_from_stego_image(stego_image):
     max_bits = stego_image.width * stego_image.height * 3
-    raw_extracted_bits = extract_lsb_rgb(stego_image, max_bits)
+    raw_extracted_bits = extract_lsb_rgb_random(stego_image, PASSWORD)
     length_header_decoded = decode_bits(raw_extracted_bits[:28])[:16]
     num_blocks = sum(int(bit) << (15 - i) for i, bit in enumerate(length_header_decoded))
     total_bits = 28 + num_blocks * 7
@@ -175,7 +197,7 @@ def main():
     key_bits = generate_quantum_bits_deterministic(len(secret_bits), PASSWORD)
     masked_bits = xor_bits(secret_bits, key_bits)
     encoded_bits = encode_with_length_and_crc(masked_bits)
-    stego = embed_lsb_rgb(cover, encoded_bits)
+    stego = embed_lsb_rgb_random(cover, encoded_bits, PASSWORD)
     stego.save("quantum_stego_password_protected_hamming.png")
     print("Stego image saved as 'quantum_stego_password_protected_hamming.png'")
     recovered_masked_bits = decode_from_stego_image(stego)
