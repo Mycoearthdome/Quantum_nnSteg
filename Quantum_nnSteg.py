@@ -1,52 +1,70 @@
 import numpy as np
 from PIL import Image
 from qiskit import QuantumCircuit, transpile
+from qiskit_aer import AerSimulator
 from qiskit_ibm_runtime import SamplerV2 as Sampler, Session
-from qiskit_aer import Aer
+import zlib
+import hashlib
 
-PASSWORD = "password"  # Your quantum key password
+PASSWORD = "password"
 
-def hash_password_to_seed(password, block_index):
-    # Simple deterministic hash function to generate a seed from password and block index
-    return abs(hash(f"{password}-{block_index}")) % (2**32)
+def deterministic_random_gates(password, block_index, num_qubits):
+    hash_input = f"{password}-{block_index}".encode('utf-8')
+    digest1 = hashlib.sha256(hash_input).digest()
+    digest2 = hashlib.sha256(digest1).digest()
+    bits1 = [(digest1[i // 8] >> (7 - (i % 8))) & 1 for i in range(num_qubits)]
+    bits2 = [(digest2[i // 8] >> (7 - (i % 8))) & 1 for i in range(num_qubits)]
+    return bits1, bits2
 
 def generate_quantum_bits_deterministic(n, password):
     bits = []
-    num_qubits = 28  # max qubits due to backend limit
+    num_qubits = 28
     num_blocks = (n + num_qubits - 1) // num_qubits
-    backend = Aer.get_backend('aer_simulator')
-
+    backend = AerSimulator()
     circuits = []
     for block_index in range(num_blocks):
-        seed = hash_password_to_seed(password, block_index)
-        np.random.seed(seed)
-
+        bits_h, bits_x = deterministic_random_gates(password, block_index, num_qubits)
         qc = QuantumCircuit(num_qubits, num_qubits)
         for i in range(num_qubits):
-            if np.random.rand() > 0.5:
-                qc.h(i)
-            if np.random.rand() > 0.5:
-                qc.x(i)
+            if bits_h[i]: qc.h(i)
+            if bits_x[i]: qc.x(i)
         qc.measure(range(num_qubits), range(num_qubits))
-
         circuits.append(qc)
-
     transpiled_circuits = transpile(circuits, backend=backend, optimization_level=0)
-
-    with Session(backend=backend) as session:
-        sampler = Sampler(mode=session)
-        job = sampler.run(transpiled_circuits, shots=1)  # Run all circuits at once
-        results = job.result()
-
-    # results is a list of Result objects, one per circuit
-    for i, pub_result in enumerate(results):
-        bit_array = pub_result.data.c
-        bitstrings = bit_array.get_bitstrings()
-        block_bits = [int(bit) for bitstring in bitstrings for bit in bitstring]
+    result = backend.run(transpiled_circuits, shots=1).result()
+    for qc_result in result.results:
+        counts = qc_result.data.counts
+        raw_key = list(counts.keys())[0]
+        if raw_key.startswith('0x'):
+            value = int(raw_key, 16)
+            bitstring = format(value, f'0{num_qubits}b')
+        else:
+            bitstring = raw_key
+        if len(bitstring) != num_qubits:
+            raise ValueError(f"Bitstring length {len(bitstring)} != expected {num_qubits}")
+        block_bits = [int(bit) for bit in bitstring[::-1]]
         bits.extend(block_bits)
-
     return bits[:n]
 
+def hamming_encode_block(data_bits_4):
+    d = data_bits_4
+    p1 = d[0] ^ d[1] ^ d[3]
+    p2 = d[0] ^ d[2] ^ d[3]
+    p3 = d[1] ^ d[2] ^ d[3]
+    return [p1, p2, d[0], p3, d[1], d[2], d[3]]
+
+def hamming_decode_block(code_bits_7):
+    p1, p2, d0, p3, d1, d2, d3 = code_bits_7
+    s1 = p1 ^ d0 ^ d1 ^ d3
+    s2 = p2 ^ d0 ^ d2 ^ d3
+    s3 = p3 ^ d1 ^ d2 ^ d3
+    syndrome = (s1 << 2) | (s2 << 1) | s3
+    corrected = list(code_bits_7)
+    if syndrome != 0:
+        error_pos = syndrome - 1
+        if error_pos < 7:
+            corrected[error_pos] ^= 1
+    return corrected[2], corrected[4], corrected[5], corrected[6]
 
 def bytes_to_bits(data):
     return [(byte >> i) & 1 for byte in data for i in reversed(range(8))]
@@ -55,85 +73,123 @@ def bits_to_bytes(bits):
     return bytes([sum(b << (7 - i) for i, b in enumerate(bits[n:n+8])) for n in range(0, len(bits), 8)])
 
 def xor_bits(bits1, bits2):
-    return [b1 ^ b2 for b1, b2 in zip(bits1, bits2)]
+    return [int(b1) ^ int(b2) for b1, b2 in zip(bits1, bits2)]
 
 def embed_lsb_rgb(image, bits):
-    """Embed bits into the LSB of RGB channels (3 bits per pixel)."""
     img = image.copy().convert("RGBA")
     pixels = np.asarray(img, dtype=np.uint8).copy()
     height, width = pixels.shape[:2]
-
     flat_pixels = pixels.reshape(-1, 4)
     num_pixels_needed = (len(bits) + 2) // 3
     if num_pixels_needed > len(flat_pixels):
         raise ValueError("Not enough pixels to embed all bits.")
-
     bit_idx = 0
     for idx in range(num_pixels_needed):
         r_bit = bits[bit_idx] if bit_idx < len(bits) else 0
         g_bit = bits[bit_idx + 1] if bit_idx + 1 < len(bits) else 0
         b_bit = bits[bit_idx + 2] if bit_idx + 2 < len(bits) else 0
         bit_idx += 3
-
-        # Sanity check: ensure bits are 0 or 1 integers
-        r_bit = 1 if r_bit else 0
-        g_bit = 1 if g_bit else 0
-        b_bit = 1 if b_bit else 0
-
         rgb = flat_pixels[idx, :3]
         rgb &= 0xFE
         rgb |= np.array([r_bit, g_bit, b_bit], dtype=np.uint8)
         flat_pixels[idx, :3] = rgb
-
     pixels = flat_pixels.reshape((height, width, 4))
     return Image.fromarray(pixels, mode='RGBA')
 
-
 def extract_lsb_rgb(image, num_bits):
-    """Extract bits from the LSB of RGB channels (3 bits per pixel)."""
     pixels = np.array(image)
-    flat_pixels = pixels.reshape(-1, 4)  # RGBA
-
+    flat_pixels = pixels.reshape(-1, 4)
     bits = []
     for idx in range(len(flat_pixels)):
         if len(bits) >= num_bits:
             break
-
         r_bit = flat_pixels[idx][0] & 1
         g_bit = flat_pixels[idx][1] & 1
         b_bit = flat_pixels[idx][2] & 1
-
         bits.extend([r_bit, g_bit, b_bit])
-
     return bits[:num_bits]
 
+def encode_bits(data_bits):
+    encoded_bits = []
+    for i in range(0, len(data_bits), 4):
+        block = data_bits[i:i+4]
+        if len(block) < 4:
+            block += [0] * (4 - len(block))
+        encoded_bits.extend(hamming_encode_block(block))
+    return encoded_bits
+
+def decode_bits(encoded_bits):
+    decoded_bits = []
+    for i in range(0, len(encoded_bits), 7):
+        block = encoded_bits[i:i+7]
+        if len(block) < 7:
+            break
+        decoded_bits.extend(hamming_decode_block(block))
+    return decoded_bits
+
+def encode_with_length_and_crc(secret_bits):
+    secret_len = len(secret_bits)
+    secret_len_bits = [(secret_len >> (15 - i)) & 1 for i in range(16)]
+    crc_val = zlib.crc32(bits_to_bytes(secret_bits)) & 0xFFFF
+    crc_bits = [(crc_val >> i) & 1 for i in reversed(range(16))]
+    termination_data_bits = [0, 0, 0, 0]
+    data_bits = secret_len_bits + secret_bits + crc_bits + termination_data_bits
+    num_blocks = (len(data_bits) + 3) // 4
+    length_bits = [(num_blocks >> (15 - i)) & 1 for i in range(16)]
+    return encode_bits(length_bits) + encode_bits(data_bits)
+
+def decode_with_length(encoded_bits):
+    length_encoded_bits = encoded_bits[:28]
+    length_decoded = decode_bits(length_encoded_bits)[:16]
+    num_blocks = sum(int(bit) << (15 - i) for i, bit in enumerate(length_decoded))
+    start = 28
+    end = start + num_blocks * 7
+    data_encoded = encoded_bits[start:end]
+    data_decoded = decode_bits(data_encoded)
+    if data_decoded[-4:] == [0, 0, 0, 0]:
+        data_decoded = data_decoded[:-4]
+    if len(data_decoded) < 32:
+        return None
+    secret_len = sum(int(bit) << (15 - i) for i, bit in enumerate(data_decoded[:16]))
+    if len(data_decoded) < 16 + secret_len + 16:
+        return None
+    secret_bits = data_decoded[16:16 + secret_len]
+    crc_bits = data_decoded[16 + secret_len:16 + secret_len + 16]
+    calc_crc = zlib.crc32(bits_to_bytes(secret_bits)) & 0xFFFF
+    calc_crc_bits = [(calc_crc >> i) & 1 for i in reversed(range(16))]
+    return secret_bits if crc_bits == calc_crc_bits else None
+
+def decode_from_stego_image(stego_image):
+    max_bits = stego_image.width * stego_image.height * 3
+    raw_extracted_bits = extract_lsb_rgb(stego_image, max_bits)
+    length_header_decoded = decode_bits(raw_extracted_bits[:28])[:16]
+    num_blocks = sum(int(bit) << (15 - i) for i, bit in enumerate(length_header_decoded))
+    total_bits = 28 + num_blocks * 7
+    extracted_bits = raw_extracted_bits[:total_bits]
+    return decode_with_length(extracted_bits)
+
 def main():
-    # 1. Load cover image
     cover = Image.open("SpongeBob_SquarePants_character.jpg").convert("RGBA")
-
-    # 2. Convert secret to bits
-    secret = b"Quantum secured by password!"  #The hidden message
-    secret_bits = bytes_to_bits(secret)
-
-    # 3. Generate pseudo-quantum key using password
+    secret = "Quantum secured by password!"
+    secret_bits = bytes_to_bits(secret.encode('utf-8'))
     key_bits = generate_quantum_bits_deterministic(len(secret_bits), PASSWORD)
-
-    # 4. XOR secret with key
     masked_bits = xor_bits(secret_bits, key_bits)
-
-    # 5. Embed into image (RGB LSBs)
-    stego = embed_lsb_rgb(cover, masked_bits)
-    stego.save("quantum_stego_password_protected.png")
-    print("Stego image saved as 'quantum_stego_password_protected.png'")
-
-    # 6. Extract and decode
-    extracted = extract_lsb_rgb(stego, len(secret_bits))
-    recovered_bits = xor_bits(extracted, key_bits)
-    recovered_secret = bits_to_bytes(recovered_bits)
-
-    print(f"Recovered secret: {recovered_secret.decode(errors='replace')}")
-    with open("recovered_secret.txt", "wb") as f:
-        f.write(recovered_secret)
+    encoded_bits = encode_with_length_and_crc(masked_bits)
+    stego = embed_lsb_rgb(cover, encoded_bits)
+    stego.save("quantum_stego_password_protected_hamming.png")
+    print("Stego image saved as 'quantum_stego_password_protected_hamming.png'")
+    recovered_masked_bits = decode_from_stego_image(stego)
+    if recovered_masked_bits is None:
+        print("Data integrity check failed. Cannot decode secret reliably.")
+        return
+    recovered_masked_bits = recovered_masked_bits[:len(secret_bits)]
+    recovered_secret_bits = xor_bits(recovered_masked_bits, key_bits)
+    recovered_secret_bytes = bits_to_bytes(recovered_secret_bits)
+    try:
+        recovered_secret = recovered_secret_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        recovered_secret = recovered_secret_bytes.decode('utf-8', errors='replace')
+    print(f"Recovered secret: {recovered_secret}")
 
 if __name__ == "__main__":
     main()
