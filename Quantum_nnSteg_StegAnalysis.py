@@ -1,14 +1,9 @@
 import numpy as np
 from PIL import Image
-from qiskit import QuantumCircuit, transpile
-from qiskit_aer import AerSimulator
 import zlib
 import hashlib
 import cv2
 import bz2
-from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import os
 
 PASSWORD = "password"
 
