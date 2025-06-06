@@ -6,6 +6,9 @@ import zlib
 import hashlib
 import cv2
 import bz2
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 
 PASSWORD = "password"
 
@@ -131,28 +134,21 @@ def deterministic_random_gates(password, block_index, num_qubits):
     bits_x = [(digest2[i // 8] >> (7 - (i % 8))) & 1 for i in range(num_qubits)]
     return bits_h, bits_x
 
-def generate_quantum_bits_deterministic(n, password):
+def generate_bits_fast(n, password):
+    num_bytes = (n + 7) // 8
+    key_material = b""
+    counter = 0
+
+    while len(key_material) < num_bytes:
+        hasher = hashlib.sha512()
+        hasher.update(password.encode())
+        hasher.update(counter.to_bytes(4, 'big'))
+        key_material += hasher.digest()
+        counter += 1
+
     bits = []
-    num_qubits = 28
-    num_blocks = (n + num_qubits - 1) // num_qubits
-    backend = AerSimulator()
-
-    for block_index in range(num_blocks):
-        bits_h, bits_x = deterministic_random_gates(password, block_index, num_qubits)
-        qc = QuantumCircuit(num_qubits, num_qubits)
-        for i in range(num_qubits):
-            if bits_h[i]: qc.h(i)
-            if bits_x[i]: qc.x(i)
-        qc.measure(range(num_qubits), range(num_qubits))
-        
-        transpiled = transpile(qc, backend=backend, optimization_level=0)
-        result = backend.run(transpiled, shots=1).result()
-        counts = result.get_counts(qc)
-
-        raw_key = list(counts.keys())[0]
-        bitstring = raw_key if not raw_key.startswith('0x') else format(int(raw_key, 16), f'0{num_qubits}b')
-        block_bits = [int(b) for b in bitstring[::-1]]
-        bits.extend(block_bits)
+    for byte in key_material[:num_bytes]:
+        bits.extend([(byte >> i) & 1 for i in reversed(range(8))])
 
     return bits[:n]
 
@@ -183,19 +179,18 @@ def decode_bits(encoded_bits):
     return [bit for i in range(0, len(encoded_bits), 7) for bit in hamming_decode_block(encoded_bits[i:i+7])]
 
 def encode_with_length_and_crc(bits):
-    # Calculate the length of the bits
+    # Ensure the bitstream is 8-bit aligned
+    if len(bits) % 8 != 0:
+        pad_len = 8 - (len(bits) % 8)
+        bits += [0] * pad_len
+        print(f"[DEBUG] Added {pad_len} bits of padding to align CRC input to byte boundary.")
+
     bit_length = len(bits)
-    
-    # Calculate the CRC32 of the bits (for integrity check)
-    crc32 = zlib.crc32(bits_to_bytes(bits))  # Ensure the bits are converted to bytes for CRC calculation
-    
-    # Convert the length to bits and concatenate with the CRC and original bits
+    crc32 = zlib.crc32(bits_to_bytes(bits))
     length_bits = int_to_bits(bit_length, 32)
     crc_bits = int_to_bits(crc32, 32)
-    
-    encoded_bits = length_bits + crc_bits + bits  # The final bitstream
-    
-    return encoded_bits
+
+    return length_bits + crc_bits + bits
 
 
 def decode_with_length_and_crc(encoded_bits):
@@ -205,6 +200,13 @@ def decode_with_length_and_crc(encoded_bits):
 
     decoded_length = bits_to_int(length_bits)
     decoded_crc = bits_to_int(crc_bits)
+    
+    # Truncate to actual declared length
+    if len(secret_bits) < decoded_length:
+        print(f"[ERROR] Not enough bits in payload. Expected {decoded_length}, got {len(secret_bits)}")
+        return None
+
+    secret_bits = secret_bits[:decoded_length]
     actual_crc = zlib.crc32(bits_to_bytes(secret_bits))
 
     print(f"[DEBUG] Expected bit length: {decoded_length}")
@@ -216,10 +218,6 @@ def decode_with_length_and_crc(encoded_bits):
         print("CRC mismatch, data is corrupted!")
         return None
 
-    if decoded_length != len(secret_bits):
-        print(f"Length mismatch: expected {decoded_length}, but got {len(secret_bits)} bits.")
-        return None
-
     return secret_bits
 
 # --- Bit utils ---
@@ -227,6 +225,9 @@ def bytes_to_bits(byte_data):
     return [int(bit) for byte in byte_data for bit in bin(byte)[2:].zfill(8)]
 
 def bits_to_bytes(bits):
+    if len(bits) % 8 != 0:
+        print(f"[WARN] bits_to_bytes received non-byte-aligned bits: {len(bits)}")
+        bits += [0] * (8 - len(bits) % 8)  # Pad with zeros
     byte_data = []
     for i in range(0, len(bits), 8):
         byte_data.append(int(''.join(str(bit) for bit in bits[i:i+8]), 2))
@@ -279,18 +280,17 @@ def extract_header_bits(image, password):
 
     header_bit_length = 64  # 8 bytes = 64 bits
 
-    # Generate deterministic embedding map (no noise map)
     pixel_indices, channels, bit_planes = generate_embedding_map(
         header_bit_length, pixel_count, password, tag="header")
 
-    # Direct extraction without permutation
     extracted_bits = [
-        (flat_pixels[idx, channel] >> bit_plane) & 1
+        int((flat_pixels[idx, channel] >> bit_plane) & 1)
         for idx, channel, bit_plane in zip(pixel_indices, channels, bit_planes)
     ]
 
-    print(f"[DEBUG] Raw extracted header bits: {extracted_bits}")
+    print(f"[DEBUG] Extracted header bits: {extracted_bits[:64]}")  # Check the first 64 bits
     return extracted_bits
+
 
 def embed_lsb_rgb_separate_header(image, full_data_bytes, password, noise_map=None):
     header_bytes = full_data_bytes[:8]
@@ -309,10 +309,11 @@ def embed_lsb_rgb_separate_header(image, full_data_bytes, password, noise_map=No
 
 
 def extract_payload_bits(image, password, total_bits):
+    print(f"[DEBUG] Starting payload extraction for {total_bits} bits")
     pixels = np.array(image, dtype=np.uint8)
     flat_pixels = pixels.reshape(-1, 4)
     pixel_count = len(flat_pixels)
-
+    print(f"[DEBUG] Pixel count: {pixel_count}")
 
     pixel_indices, channels, bit_planes = generate_embedding_map(total_bits, pixel_count, password, tag="payload")
     indices = get_permutation_indices(total_bits, password)
@@ -323,20 +324,26 @@ def extract_payload_bits(image, password, total_bits):
     ]
 
     unpermuted_bits = unpermute_bits(extracted_bits, indices)
+    print(f"[DEBUG] Payload bits extracted: {len(unpermuted_bits)} bits")
     return unpermuted_bits
 
 
-def extract_lsb_rgb_random(image, password):
-    # Skip parsing header — just extract a fixed number of bits first
-    header_bits = extract_header_bits(image, password)
-    header_bytes = bits_to_bytes(header_bits)
 
-    # Just try a large enough number of bits; we'll truncate later using embedded length
-    # Or: assume rest of image is payload
-    payload_capacity = image.width * image.height * 9 - 64
-    payload_bits = extract_payload_bits(image, password, payload_capacity)
+def extract_lsb_rgb_random(image, password):
+    header_bits = extract_header_bits(image, password)
+    print(f"[DEBUG] Header bits: {header_bits}")
+    decoded_length = bits_to_int(header_bits[:32])
+    print(f"[DEBUG] Decoded length from header: {decoded_length}")
+    
+    if decoded_length <= 0:
+        print("[ERROR] Decoded length is zero or negative, aborting payload extraction.")
+        return header_bits  # or None
+    
+    payload_bits = extract_payload_bits(image, password, decoded_length)
+    print("PAYLOAD EXTRACTED!")
 
     return header_bits + payload_bits
+
 
 
 def compare_noise_data(original_data, extracted_data):
@@ -382,64 +389,93 @@ def embed_file_in_image(image, file_path, password):
     # Step 2: Add length and CRC to the encoded bits
     encoded_bits_with_crc = encode_with_length_and_crc(encoded_bits)
 
-    # Step 3: XOR the entire encoded bitstream with quantum-generated key
-    key_bits = generate_quantum_bits_deterministic(len(encoded_bits_with_crc), password)
-    masked_bits = xor_bits(encoded_bits_with_crc, key_bits)
+    print(f"[DEBUG] Data bits before Hamming: {len(data_bits)}")
+    print(f"[DEBUG] Bits after Hamming:       {len(encoded_bits)}")
+    print(f"[DEBUG] Bits after CRC + length:  {len(encoded_bits_with_crc)}")
 
-    print(f"[DEBUG] Embedding file of {len(masked_bits)} bits")
+    # Step 3: Generate XOR key from password
+    key_bits = generate_bits_fast(len(encoded_bits_with_crc), password)
 
-    # Split header (first 64 bits) and payload
-    header_bits = masked_bits[:64]  # 32-bit length + 32-bit CRC
-    payload_bits = masked_bits[64:]
+    # Step 4: XOR only the payload bits (skip header for masking)
+    header_bits = encoded_bits_with_crc[:64]  # 32-bit length + 32-bit CRC
+    payload_bits = encoded_bits_with_crc[64:]
+    masked_payload_bits = xor_bits(payload_bits, key_bits[64:])
+
+    # Combine header (clear) + masked payload
+    final_bits = header_bits + masked_payload_bits
+
+    print(f"[DEBUG] Embedding file of {len(final_bits)} bits")
 
     # Convert to bytes for embedding
-    header_bytes = bits_to_bytes(header_bits)
-    payload_bytes = bits_to_bytes(payload_bits)
-    full_data_bytes = header_bytes + payload_bytes
+    final_bytes = bits_to_bytes(final_bits)
 
     # Capacity check
     capacity = image.width * image.height * 9
-    if len(full_data_bytes) * 8 > capacity:
-        raise ValueError(f"File too large: {len(full_data_bytes)*8} bits > {capacity} bits")
+    if len(final_bytes) * 8 > capacity:
+        raise ValueError(f"File too large: {len(final_bytes)*8} bits > {capacity} bits")
 
     print(f"[DEBUG] Embedding capacity: {capacity} bits")
-    print(f"[DEBUG] Bits to embed: {len(full_data_bytes) * 8}")
+    print(f"[DEBUG] Bits to embed: {len(final_bytes) * 8}")
 
     # Embed header without permutation, payload with permutation
-    stego_img = embed_lsb_rgb_separate_header(image, full_data_bytes, password, noise_map=None)
+    stego_img = embed_lsb_rgb_separate_header(image, final_bytes, password, noise_map=None)
     print("[DEBUG] File data embedded into image.")
     return stego_img
 
-
-
 def extract_file_from_image(image, password):
-    # Step 1: Extract just the header (64 bits)
-    header_bits = extract_header_bits(image, password)
+    # Step 1: Extract the header bits (first 64 bits)
+    all_masked_bits = extract_lsb_rgb_random(image, password)
+    masked_header_bits = all_masked_bits[:64]
+    print(f"[DEBUG] UNMasked header bits: {masked_header_bits}")  # Check masked header
+    unmasked_header_bits = masked_header_bits
 
-    # These are already masked, so we extract them as-is
-    payload_capacity = image.width * image.height * 9 - 64
+    # Step 3: Parse the length and CRC from the header
+    length_bits = unmasked_header_bits[:32]  # First 32 bits for length
+    crc_bits = unmasked_header_bits[32:]    # Next 32 bits for CRC
+    decoded_length = bits_to_int(length_bits)
 
-    # Step 2: Extract the rest of the bits (payload), as many as the image can hold
-    payload_bits = extract_payload_bits(image, password, payload_capacity)
+    print(f"[DEBUG] Decoded length from header: {decoded_length}")  # Check decoded length
 
-    # Combine header + payload (both are masked at this point)
-    all_masked_bits = header_bits + payload_bits
+    # If the length is greater than the image's pixel capacity, something went wrong
+    if decoded_length <= 0 or decoded_length > image.width * image.height * 9:  # Check max image capacity
+        print("[ERROR] Invalid decoded length")
+        return None
 
-    # Step 3: Generate quantum key and XOR to unmask
-    key_bits = generate_quantum_bits_deterministic(len(all_masked_bits), password)
-    unmasked_bits = xor_bits(all_masked_bits, key_bits)
+    print(f"[DEBUG] Decoded bit length from header: {decoded_length}")
 
-    # Step 4: Extract and validate length + CRC
+    # Step 4: Re-extract full masked bitstream (header + payload)
+    total_bit_length = 64 + decoded_length
+    all_masked_bits = all_masked_bits[:total_bit_length]
+    
+    # Step 5: Generate full quantum key matching full bitstream length
+    full_key_bits = generate_bits_fast(total_bit_length, password)
+
+    # Step 6: Unmask the entire bitstream
+    # Leave header untouched, only unmask the payload
+    unmasked_bits = all_masked_bits[:64] + xor_bits(all_masked_bits[64:], full_key_bits[64:])
+
+
+    print(f"[DEBUG] Unmasked total bit length: {len(unmasked_bits)}")
+    
+    # Step 7: Validate CRC and extract payload
     decoded_bits = decode_with_length_and_crc(unmasked_bits)
     if decoded_bits is None:
         print("[ERROR] Failed CRC or length mismatch.")
         return None
 
-    # Step 5: Hamming decode
+    trunc_length = (len(decoded_bits) // 7) * 7
+    decoded_bits = decoded_bits[:trunc_length]
+
+    # Step 8: Hamming decode the payload
     data_bits = decode_bits(decoded_bits)
+
+    print(f"[DEBUG] Bits after Hamming decode: {len(data_bits)}")
+
     data_bytes = bits_to_bytes(data_bits)
 
-    # Step 6: Decompress the data
+    
+
+    # Step 9: Decompress to recover original file
     try:
         decompressed = bz2.decompress(data_bytes)
         print(f"[DEBUG] Extracted file content size: {len(decompressed)} bytes")
@@ -447,7 +483,6 @@ def extract_file_from_image(image, password):
     except Exception as e:
         print(f"[ERROR] Failed to decompress: {e}")
         return None
-
 
 
 # --- Main ---
